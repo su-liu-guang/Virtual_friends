@@ -1,5 +1,6 @@
 from nonebot import on_message, on_command, logger, require
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent, GroupMessageEvent, Message as OB11Message
+from nonebot.adapters.onebot.v11.permission import GROUP_OWNER
 from nonebot.permission import SUPERUSER
 from nonebot.exception import MatcherException
 from nonebot.params import CommandArg
@@ -171,7 +172,7 @@ async def handle_memory_status(bot: Bot, event: MessageEvent):
 ━━━━━━━━━━━━━━""")
 
 # 指令：遗忘
-forget_cmd = on_command("遗忘", priority=5, block=True, permission=SUPERUSER)
+forget_cmd = on_command("遗忘", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
 
 @forget_cmd.handle()
 async def handle_forget(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
@@ -188,7 +189,7 @@ async def handle_forget(bot: Bot, event: MessageEvent, args: OB11Message = Comma
         await forget_cmd.finish(f"未找到包含 '{keyword}' 的记忆")
 
 # 指令：清空记忆
-clear_memory = on_command("清空记忆", aliases={"重置记忆"}, priority=5, block=True, permission=SUPERUSER)
+clear_memory = on_command("清空记忆", aliases={"重置记忆"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
 
 @clear_memory.handle()
 async def handle_clear_memory(bot: Bot, event: MessageEvent):
@@ -204,7 +205,7 @@ async def handle_clear_memory(bot: Bot, event: MessageEvent):
         await clear_memory.finish(f"❌ 清空失败: {e}")
 
 # 指令：提示词列表
-persona_list = on_command("提示词列表", aliases={"人设列表"}, permission=SUPERUSER, priority=5, block=True)
+persona_list = on_command("提示词列表", aliases={"人设列表"}, permission=SUPERUSER | GROUP_OWNER, priority=5, block=True)
 
 @persona_list.handle()
 async def handle_persona_list(bot: Bot, event: MessageEvent):
@@ -230,7 +231,7 @@ async def handle_view_persona(bot: Bot, event: MessageEvent, args: OB11Message =
     await view_persona.finish(f"📋 {arg_text} ({persona.get('description')})\n\n{persona.get('prompt')}")
 
 # 指令：添加提示词
-add_persona = on_command("添加提示词", aliases={"添加人设","增加提示词","增加人设"}, priority=5, block=True, permission=SUPERUSER)
+add_persona = on_command("添加提示词", aliases={"添加人设","增加提示词","增加人设"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
 
 @add_persona.handle()
 async def handle_add_persona(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
@@ -263,34 +264,37 @@ async def handle_delete_persona(bot: Bot, event: MessageEvent, args: OB11Message
     else:
         await delete_persona.finish("❌ 删除失败")
 
-# 指令：人生启动/世界终结
-toggle_plugin = on_command("人生启动", aliases={"世界终结"}, priority=5, block=True, permission=SUPERUSER)
+# 指令：人生启动
+enable_plugin = on_command("人生启动", aliases={"世界开启","故事开始"},priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
 
-@toggle_plugin.handle()
-async def handle_toggle_plugin(bot: Bot, event: GroupMessageEvent):
+@enable_plugin.handle()
+async def handle_enable_plugin(bot: Bot, event: GroupMessageEvent):
     group_id = str(event.group_id)
-    cmd = event.get_plaintext().strip()
-    
-    if "人生启动" in cmd:
-        # 获取群名
-        try:
-            group_info = await bot.get_group_info(group_id=int(group_id))
-            group_name = group_info.get("group_name", "未知群组")
-        except:
-            group_name = "未知群组"
+    # 获取群名用于记录
+    try:
+        group_info = await bot.get_group_info(group_id=int(group_id))
+        group_name = group_info.get("group_name", "未知群组")
+    except:
+        group_name = "未知群组"
 
-        if config_manager.add_to_whitelist(group_id, group_name):
-            await toggle_plugin.finish(f"✨ 人生启动成功！本群 ({group_name}) 已启用插件")
-        else:
-            await toggle_plugin.finish("✅ 本群已启用")
+    if config_manager.add_to_whitelist(group_id, group_name):
+        await enable_plugin.finish(f"✨ 人生启动成功！本群 ({group_name}) 已启用插件")
     else:
-        if config_manager.remove_from_whitelist(group_id):
-            await toggle_plugin.finish("🌙 世界终结... 本群已禁用插件")
-        else:
-            await toggle_plugin.finish("⚠️ 本群未启用")
+        await enable_plugin.finish("✅ 本群已启用")
+
+# 指令：世界终结
+disable_plugin = on_command("世界终结", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+
+@disable_plugin.handle()
+async def handle_disable_plugin(bot: Bot, event: GroupMessageEvent):
+    group_id = str(event.group_id)
+    if config_manager.remove_from_whitelist(group_id):
+        await disable_plugin.finish("🌙 世界终结... 本群已禁用插件")
+    else:
+        await disable_plugin.finish("⚠️ 本群未启用")
 
 # 指令：查看白名单
-view_whitelist = on_command("查看白名单", priority=5, block=True, permission=SUPERUSER)
+view_whitelist = on_command("查看白名单", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
 
 @view_whitelist.handle()
 async def handle_view_whitelist(bot: Bot, event: MessageEvent):
@@ -308,7 +312,7 @@ async def handle_view_whitelist(bot: Bot, event: MessageEvent):
     await view_whitelist.finish(f"📋 白名单群组:\n" + "\n".join(msg_lines))
 
 # 指令：查看配置
-view_config = on_command("查看配置", aliases={"vf配置", "当前配置"}, priority=5, block=True, permission=SUPERUSER)
+view_config = on_command("查看配置", aliases={"vf配置", "当前配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
 
 @view_config.handle()
 async def handle_view_config(bot: Bot, event: MessageEvent):
@@ -327,7 +331,7 @@ async def handle_view_config(bot: Bot, event: MessageEvent):
     await view_config.finish(f"⚙️ 当前配置 (复制修改后使用 /修改配置 发送):\n{json.dumps(display_config, ensure_ascii=False, indent=2)}")
 
 # 指令：修改配置
-update_config = on_command("修改配置", aliases={"vf设置", "更新配置"}, priority=5, block=True, permission=SUPERUSER)
+update_config = on_command("修改配置", aliases={"vf设置", "更新配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
 
 @update_config.handle()
 async def handle_update_config(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
@@ -385,17 +389,18 @@ async def handle_help(bot: Bot, event: MessageEvent):
 • /查看提示词 [名称] - 查看指定人设详情
 • /记忆状态 - 查看当前群聊的记忆统计
 
-管理指令 (仅超管)
+管理指令 (超管/群主)
 • /切换人设 [名称] - 切换当前群聊的 AI 人设
 • /人生启动 - 在当前群启用插件 (加入白名单)
 • /世界终结 - 在当前群禁用插件 (移出白名单)
 • /清空记忆 - 删除当前群的所有记忆数据
 • /遗忘 [关键词] - 删除包含关键词的特定记忆
 • /添加提示词 <名称> <描述> <内容> - 添加新人设
-• /删除提示词 [名称] - 删除指定人设
+• /删除提示词 [名称] - 删除指定人设 (仅超管)
 • /查看白名单 - 查看已启用插件的群
 • /查看配置 - 查看当前群组的详细配置
 • /修改配置 <JSON> - 修改当前群组配置""")
+
 
 # 启动初始化
 import nonebot
@@ -419,3 +424,9 @@ async def startup():
             logger.info("主动行为调度已启动, 基础心跳 1 分钟")
         except Exception as exc:
             logger.error(f"主动行为调度启动失败: {exc}")
+
+@driver.on_shutdown
+async def shutdown():
+    from tortoise import Tortoise
+    await Tortoise.close_connections()
+    logger.debug("数据库连接已关闭")

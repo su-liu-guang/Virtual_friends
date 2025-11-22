@@ -55,6 +55,8 @@ class ActiveBehaviorManager:
 		for group_id in group_ids:
 			try:
 				await self._process_group(group_id)
+			except asyncio.CancelledError:
+				raise
 			except Exception as exc:  # pragma: no cover - 避免单个群异常影响全局
 				logger.error(f"[Active] 处理群 {group_id} 时异常: {exc}", exc_info=True)
 

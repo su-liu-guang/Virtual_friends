@@ -84,8 +84,8 @@ class ContextBuilder:
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_content.strip()}]
         
         # Recent Layer - 最近对话
-        recent_msgs = await Message.filter(group_id=group_id).order_by("-timestamp").limit(100).all()
-        recent_msgs.reverse()
+        # 使用时间+ID双重排序，保证在分钟级时间戳相同的情况下依然保持真实顺序
+        recent_msgs = await Message.filter(group_id=group_id).order_by("timestamp", "id").limit(100).all()
         
         for msg in recent_msgs:
             content = msg.content
