@@ -17,6 +17,7 @@ class Message(Model):
     content = fields.TextField()
     image_md5 = fields.CharField(max_length=32, null=True)
     timestamp = fields.DatetimeField(index=True)
+    display_time = fields.CharField(max_length=30, null=True, description="人类可读的时间格式 YYYY-MM-DD HH:MM")
     weekday = fields.CharField(max_length=10, null=True)
     is_processed = fields.BooleanField(default=False, index=True)
     

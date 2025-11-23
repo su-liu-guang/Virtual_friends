@@ -16,7 +16,7 @@ from .logic import ContextBuilder, process_image_message
 from .scheduler import MemoryScheduler
 from .active_behavior import ActiveBehaviorManager
 
-# 初始化
+# ================= 全局组件与客户端 =================
 config_manager = ConfigManager()
 vision_client = VisionClient()
 chat_client = ChatClient()
@@ -30,22 +30,78 @@ except RuntimeError:
     scheduler = None
     logger.warning("未安装 nonebot_plugin_apscheduler, 主动行为功能已禁用")
 
-# 工具函数
+# ================= 常量与别名 =================
+
+WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"]
+
+# 配置键名别名映射（内部 key -> 展示名）
+KEY_ALIAS = {
+    "persona_name": "人设名称",
+    "reply_rate": "被动回复概率",
+    "active_mode": "主动发言开关",
+    "active_hours": "主动发言时间段 [起始小时, 结束小时]",
+    "cooldown_hours": "主动发言冷却(小时)",
+    "active_check_interval": "主动检查间隔(分钟)",
+    "idle_trigger_probability": "闲聊触发概率",
+    "silence_threshold": "沉默阈值(小时)",
+    "group_name": "群名称",
+}
+
+# 展示名/中文别名 -> 内部 key
+ALIAS_TO_KEY = {
+    # persona_name
+    "人设名称": "persona_name",
+    "人设": "persona_name",
+    "persona_name": "persona_name",
+    # reply_rate
+    "被动回复概率": "reply_rate",
+    "reply_rate": "reply_rate",
+    # active_mode
+    "主动发言开关": "active_mode",
+    "active_mode": "active_mode",
+    # active_hours
+    "主动发言时间段": "active_hours",
+    "active_hours": "active_hours",
+    # cooldown_hours
+    "主动发言冷却(小时)": "cooldown_hours",
+    "冷却时间": "cooldown_hours",
+    "cooldown_hours": "cooldown_hours",
+    # active_check_interval
+    "主动检查间隔(分钟)": "active_check_interval",
+    "active_check_interval": "active_check_interval",
+    # idle_trigger_probability
+    "闲聊触发概率": "idle_trigger_probability",
+    "idle_trigger_probability": "idle_trigger_probability",
+    # silence_threshold
+    "沉默阈值(小时)": "silence_threshold",
+    "silence阈值": "silence_threshold",
+    "silence_threshold": "silence_threshold",
+    # group_name
+    "群名称备注": "group_name",
+    "group_name": "group_name",
+}
+
+# ================= 工具函数 =================
+
 def get_group_id(event: MessageEvent) -> str:
     return str(event.group_id) if isinstance(event, GroupMessageEvent) else str(event.user_id)
 
 
-WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"]
+def get_current_time() -> datetime:
+    """获取当前带时区的精准时间"""
+    return datetime.now().astimezone()
 
 
-def now_with_minute_precision() -> datetime:
-    return datetime.now().replace(second=0, microsecond=0)
+def format_display_time(dt: datetime) -> str:
+    """格式化为人类/AI易读的分钟级时间"""
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def get_weekday_label(dt: datetime) -> str:
     return f"星期{WEEKDAY_CN[dt.isoweekday() - 1]}"
 
-# 消息处理器
+# ================= 消息处理 =================
+
 message_handler = on_message(priority=10, block=False)
 
 @message_handler.handle()
@@ -87,14 +143,17 @@ async def handle_message(bot: Bot, event: MessageEvent):
                 logger.success(f"图片处理完成, MD5: {image_md5}")
                 break
     
-    timestamp = now_with_minute_precision()
+    timestamp = get_current_time()
+    display_time = format_display_time(timestamp)
     weekday_label = get_weekday_label(timestamp)
+    
     await Message.create(
         group_id=group_id,
         role="user",
         content=text_content,
         image_md5=image_md5,
         timestamp=timestamp,
+        display_time=display_time,
         weekday=weekday_label,
         is_processed=False
     )
@@ -115,12 +174,15 @@ async def handle_message(bot: Bot, event: MessageEvent):
     response = response.strip()  # 去除首尾空格和换行
     
     # 存储并发送回复
-    reply_timestamp = now_with_minute_precision()
+    reply_timestamp = get_current_time()
+    reply_display_time = format_display_time(reply_timestamp)
+    
     await Message.create(
         group_id=group_id,
         role="ai",
         content=response,
         timestamp=reply_timestamp,
+        display_time=reply_display_time,
         weekday=get_weekday_label(reply_timestamp),
         is_processed=False
     )
@@ -129,8 +191,26 @@ async def handle_message(bot: Bot, event: MessageEvent):
     # 触发后台任务
     asyncio.create_task(memory_scheduler.check_and_process(group_id))
 
-# 指令：切换人设
+# ================= 指令注册 =================
+
 switch_persona = on_command("切换人设", aliases={"切换提示词"}, priority=5, block=True)
+memory_status = on_command("记忆状态", aliases={"查看记忆"}, priority=5, block=True)
+forget_cmd = on_command("遗忘", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+clear_memory = on_command("清空记忆", aliases={"重置记忆"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+persona_list = on_command("提示词列表", aliases={"人设列表"}, permission=SUPERUSER | GROUP_OWNER, priority=5, block=True)
+view_persona = on_command("查看提示词", aliases={"查看人设"}, priority=5, block=True)
+add_persona = on_command("添加提示词", aliases={"添加人设", "增加提示词", "增加人设"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+delete_persona = on_command("删除提示词", aliases={"删除人设"}, priority=5, block=True, permission=SUPERUSER)
+enable_plugin = on_command("人生启动", aliases={"世界开启", "故事开始"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+disable_plugin = on_command("世界终结", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+view_whitelist = on_command("查看白名单", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+view_config = on_command("查看配置", aliases={"vf配置", "当前配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+update_config = on_command("修改配置", aliases={"vf设置", "更新配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+help_cmd = on_command("vf帮助", aliases={"vf菜单", "vf指令列表"}, priority=5, block=True)
+
+# ================= 指令处理 =================
+
+# --- 人设与记忆 ---
 
 @switch_persona.handle()
 async def handle_switch_persona(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
@@ -145,10 +225,7 @@ async def handle_switch_persona(bot: Bot, event: MessageEvent, args: OB11Message
         await switch_persona.finish(f"人设不存在。可用人设: {', '.join(personas.keys())}")
     
     config_manager.update_instance_config(group_id, {"persona_name": arg_text})
-    await switch_persona.finish(f"已切换至人设: {personas[arg_text]['description']}")
-
-# 指令：记忆状态
-memory_status = on_command("记忆状态",aliases={"查看记忆"}, priority=5, block=True)
+    await switch_persona.finish(f"已切换至人设: {arg_text}\n描述: {personas[arg_text]['description']}")
 
 @memory_status.handle()
 async def handle_memory_status(bot: Bot, event: MessageEvent):
@@ -171,9 +248,6 @@ async def handle_memory_status(bot: Bot, event: MessageEvent):
 ⏳ 待处理消息: {pending} 条
 ━━━━━━━━━━━━━━""")
 
-# 指令：遗忘
-forget_cmd = on_command("遗忘", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
-
 @forget_cmd.handle()
 async def handle_forget(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
     keyword = args.extract_plain_text().strip()
@@ -188,9 +262,6 @@ async def handle_forget(bot: Bot, event: MessageEvent, args: OB11Message = Comma
     else:
         await forget_cmd.finish(f"未找到包含 '{keyword}' 的记忆")
 
-# 指令：清空记忆
-clear_memory = on_command("清空记忆", aliases={"重置记忆"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
-
 @clear_memory.handle()
 async def handle_clear_memory(bot: Bot, event: MessageEvent):
     group_id = get_group_id(event)
@@ -204,17 +275,13 @@ async def handle_clear_memory(bot: Bot, event: MessageEvent):
     except Exception as e:
         await clear_memory.finish(f"❌ 清空失败: {e}")
 
-# 指令：提示词列表
-persona_list = on_command("提示词列表", aliases={"人设列表"}, permission=SUPERUSER | GROUP_OWNER, priority=5, block=True)
+# --- 人设配置 ---
 
 @persona_list.handle()
 async def handle_persona_list(bot: Bot, event: MessageEvent):
     personas = config_manager.get_personas()
     msg = "\n".join([f"• {k}: {v.get('description', '无')}" for k, v in personas.items()])
     await persona_list.finish(f"📝 可用人设:\n{msg}\n使用 /切换人设 [名称] 切换")
-
-# 指令：查看提示词
-view_persona = on_command("查看提示词", aliases={"查看人设"}, priority=5, block=True)
 
 @view_persona.handle()
 async def handle_view_persona(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
@@ -230,9 +297,6 @@ async def handle_view_persona(bot: Bot, event: MessageEvent, args: OB11Message =
         
     await view_persona.finish(f"📋 {arg_text} ({persona.get('description')})\n\n{persona.get('prompt')}")
 
-# 指令：添加提示词
-add_persona = on_command("添加提示词", aliases={"添加人设","增加提示词","增加人设"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
-
 @add_persona.handle()
 async def handle_add_persona(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
     text = args.extract_plain_text().strip()
@@ -246,9 +310,6 @@ async def handle_add_persona(bot: Bot, event: MessageEvent, args: OB11Message = 
         await add_persona.finish(f"✅ 已添加人设 '{name}'")
     else:
         await add_persona.finish("❌ 添加失败")
-
-# 指令：删除提示词
-delete_persona = on_command("删除提示词", aliases={"删除人设"}, priority=5, block=True, permission=SUPERUSER)
 
 @delete_persona.handle()
 async def handle_delete_persona(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
@@ -264,8 +325,7 @@ async def handle_delete_persona(bot: Bot, event: MessageEvent, args: OB11Message
     else:
         await delete_persona.finish("❌ 删除失败")
 
-# 指令：人生启动
-enable_plugin = on_command("人生启动", aliases={"世界开启","故事开始"},priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+# --- 插件开关与白名单 ---
 
 @enable_plugin.handle()
 async def handle_enable_plugin(bot: Bot, event: GroupMessageEvent):
@@ -282,9 +342,6 @@ async def handle_enable_plugin(bot: Bot, event: GroupMessageEvent):
     else:
         await enable_plugin.finish("✅ 本群已启用")
 
-# 指令：世界终结
-disable_plugin = on_command("世界终结", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
-
 @disable_plugin.handle()
 async def handle_disable_plugin(bot: Bot, event: GroupMessageEvent):
     group_id = str(event.group_id)
@@ -292,9 +349,6 @@ async def handle_disable_plugin(bot: Bot, event: GroupMessageEvent):
         await disable_plugin.finish("🌙 世界终结... 本群已禁用插件")
     else:
         await disable_plugin.finish("⚠️ 本群未启用")
-
-# 指令：查看白名单
-view_whitelist = on_command("查看白名单", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
 
 @view_whitelist.handle()
 async def handle_view_whitelist(bot: Bot, event: MessageEvent):
@@ -311,8 +365,7 @@ async def handle_view_whitelist(bot: Bot, event: MessageEvent):
     
     await view_whitelist.finish(f"📋 白名单群组:\n" + "\n".join(msg_lines))
 
-# 指令：查看配置
-view_config = on_command("查看配置", aliases={"vf配置", "当前配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+# --- 配置管理 ---
 
 @view_config.handle()
 async def handle_view_config(bot: Bot, event: MessageEvent):
@@ -323,15 +376,18 @@ async def handle_view_config(bot: Bot, event: MessageEvent):
     config = config_manager.get_instance_config(group_id)
     # 复制一份配置，避免修改原对象
     display_config = config.copy()
-    
-    # 移除不建议手动修改或不应发送的字段
-    for k in ("whitelisted", "group_name"):
-        display_config.pop(k, None)
-    
-    await view_config.finish(f"⚙️ 当前配置 (复制修改后使用 /修改配置 发送):\n{json.dumps(display_config, ensure_ascii=False, indent=2)}")
 
-# 指令：修改配置
-update_config = on_command("修改配置", aliases={"vf设置", "更新配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+    aliased_config = {}
+    for k, v in display_config.items():
+        if k == "whitelisted":
+            continue
+        aliased_key = KEY_ALIAS.get(k, k)
+        aliased_config[aliased_key] = v
+    
+    await view_config.finish(
+        "⚙️ 当前配置 \n /修改配置 \n"
+        f"{json.dumps(aliased_config, ensure_ascii=False, indent=2)}"
+    )
 
 @update_config.handle()
 async def handle_update_config(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
@@ -351,17 +407,24 @@ async def handle_update_config(bot: Bot, event: MessageEvent, args: OB11Message 
     if not isinstance(new_config, dict):
         await update_config.finish("❌ 配置必须是 JSON 对象")
         
-    # 安全过滤：只允许修改特定的配置项
+    # 安全过滤：只允许修改特定的配置项（通过别名映射到内部 key）
     safe_config = {}
-    valid_keys = [
-        "persona_name", "reply_rate", "active_mode", "active_hours", 
-        "active_check_interval", "idle_trigger_probability", "silence_threshold",
-        "group_name" # 允许修改群名备注
-    ]
-    
-    for k, v in new_config.items():
-        if k in valid_keys:
-            safe_config[k] = v
+    valid_internal_keys = {
+        "persona_name",
+        "reply_rate",
+        "active_mode",
+        "active_hours",
+        "cooldown_hours",
+        "active_check_interval",
+        "idle_trigger_probability",
+        "silence_threshold",
+        "group_name",
+    }
+
+    for raw_key, v in new_config.items():
+        internal_key = ALIAS_TO_KEY.get(raw_key, raw_key)
+        if internal_key in valid_internal_keys:
+            safe_config[internal_key] = v
             
     if not safe_config:
         await update_config.finish("⚠️ 未检测到有效的配置项")
@@ -370,15 +433,19 @@ async def handle_update_config(bot: Bot, event: MessageEvent, args: OB11Message 
     
     # 反馈更新后的配置
     final_config = config_manager.get_instance_config(group_id)
-    # 同样移除 whitelisted
+    # 同样移除 whitelisted，并应用别名展示
     display_final = final_config.copy()
     if "whitelisted" in display_final:
         del display_final["whitelisted"]
-        
-    await update_config.finish(f"✅ 配置已更新:\n{json.dumps(display_final, ensure_ascii=False, indent=2)}")
 
-# 指令：帮助
-help_cmd = on_command("vf帮助", aliases={"vf菜单", "vf指令列表"}, priority=5, block=True)
+    aliased_final = {}
+    for k, v in display_final.items():
+        aliased_key = KEY_ALIAS.get(k, k)
+        aliased_final[aliased_key] = v
+        
+    await update_config.finish(f"✅ 配置已更新:\n{json.dumps(aliased_final, ensure_ascii=False, indent=2)}")
+
+# --- 帮助信息 ---
 
 @help_cmd.handle()
 async def handle_help(bot: Bot, event: MessageEvent):
@@ -402,7 +469,8 @@ async def handle_help(bot: Bot, event: MessageEvent):
 • /修改配置 <JSON> - 修改当前群组配置""")
 
 
-# 启动初始化
+# ================= 生命周期事件 =================
+
 import nonebot
 driver = nonebot.get_driver()
 

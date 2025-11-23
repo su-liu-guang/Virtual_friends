@@ -19,6 +19,7 @@ class ConfigManager:
             "reply_rate": 0.3,
             "active_mode": False,
             "active_hours": [8, 23],
+            "cooldown_hours": 2,
             "active_check_interval": 45,  # 主动行为检查间隔(分钟)
             "idle_trigger_probability": 0.05,  # 闲聊触发概率
             "silence_threshold": 24

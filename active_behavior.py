@@ -69,7 +69,7 @@ class ActiveBehaviorManager:
 		if not self.config_manager.is_in_whitelist(group_id):
 			return
 
-		now = datetime.now()
+		now = datetime.now().astimezone()
 		
 		# 检查间隔控制
 		check_interval = config.get("active_check_interval", 45)  # 默认 45 分钟
@@ -87,10 +87,11 @@ class ActiveBehaviorManager:
 
 		# 软性过滤层
 		last_message = await Message.filter(group_id=group_id).order_by("-timestamp").first()
+		group_cooldown = self._safe_int(config.get("cooldown_hours"), default=self.cooldown_hours)
 		hours_since_last_msg = self._hours_since(last_message.timestamp, now) if last_message else float("inf")
-		if hours_since_last_msg < self.cooldown_hours:
+		if hours_since_last_msg < group_cooldown:
 			logger.debug(
-				f"[Active] 群 {group_id} 距离上次互动仅 {hours_since_last_msg:.2f}h, 仍在冷却中"
+				f"[Active] 群 {group_id} 距离上次互动仅 {hours_since_last_msg:.2f}h, 仍在冷却中(冷却阈值: {group_cooldown}h)"
 			)
 			return
 
@@ -136,12 +137,14 @@ class ActiveBehaviorManager:
 			return
 
 		if await self._deliver_message(group_id, reply):
-			stored_time = truncate_to_minute(now)
+			stored_time = now
+			display_time = now.strftime("%Y-%m-%d %H:%M")
 			await Message.create(
 				group_id=group_id,
 				role="ai",
 				content=reply,
 				timestamp=stored_time,
+				display_time=display_time,
 				weekday=weekday_label(stored_time),
 				is_processed=False,
 			)
