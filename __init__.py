@@ -1,9 +1,11 @@
+import nonebot
 from nonebot import on_message, on_command, logger, require
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent, GroupMessageEvent, Message as OB11Message
 from nonebot.adapters.onebot.v11.permission import GROUP_OWNER
 from nonebot.permission import SUPERUSER
 from nonebot.exception import MatcherException
 from nonebot.params import CommandArg
+from nonebot.plugin import PluginMetadata
 import json
 from datetime import datetime
 import asyncio
@@ -15,6 +17,14 @@ from .clients import VisionClient, ChatClient
 from .logic import ContextBuilder, process_image_message
 from .scheduler import MemoryScheduler
 from .active_behavior import ActiveBehaviorManager
+
+__plugin_meta__ = PluginMetadata(
+    name="Virtual Friends",
+    description="虚拟好友群聊插件，提供人设驱动对话与记忆管理能力。",
+    usage="发送 /vf帮助 查看所有功能指令。",
+    type="application",
+    supported_adapters={"~onebot.v11"},
+)
 
 # ================= 全局组件与客户端 =================
 config_manager = ConfigManager()
@@ -81,6 +91,31 @@ ALIAS_TO_KEY = {
     "group_name": "group_name",
 }
 
+# ================= 命令前缀与工具函数 =================
+
+DRIVER = nonebot.get_driver()
+COMMAND_PREFIXES = tuple(prefix for prefix in DRIVER.config.command_start if prefix)
+
+def is_command_like_message(text: str) -> bool:
+    stripped = text.lstrip()
+    if not stripped or not COMMAND_PREFIXES:
+        return False
+    return stripped.startswith(COMMAND_PREFIXES)
+
+
+def format_context_for_debug(context: list) -> str:
+    lines = ["[VF Debug] 发送给 AI 的完整上下文:"]
+    for idx, msg in enumerate(context, start=1):
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            try:
+                content = json.dumps(content, ensure_ascii=False)
+            except TypeError:
+                content = str(content)
+        lines.append(f"[{idx}] role={role}\n{content}")
+    return "\n".join(lines)
+
 # ================= 工具函数 =================
 
 def get_group_id(event: MessageEvent) -> str:
@@ -102,7 +137,7 @@ def get_weekday_label(dt: datetime) -> str:
 
 # ================= 消息处理 =================
 
-message_handler = on_message(priority=10, block=False)
+message_handler = on_message(priority=95, block=False)
 
 @message_handler.handle()
 async def handle_message(bot: Bot, event: MessageEvent):
@@ -111,6 +146,12 @@ async def handle_message(bot: Bot, event: MessageEvent):
         return
     
     group_id = get_group_id(event)
+    text_content = event.get_plaintext().strip()
+    user_nickname = event.sender.card or event.sender.nickname or f"用户{event.user_id}"
+    user_id = str(event.user_id)
+
+    if is_command_like_message(text_content):
+        return
     
     # 白名单检查
     if isinstance(event, GroupMessageEvent) and not config_manager.is_in_whitelist(group_id):
@@ -128,7 +169,6 @@ async def handle_message(bot: Bot, event: MessageEvent):
     if has_image and not should_reply:
         return
 
-    text_content = event.get_plaintext().strip()
     logger.info(f"收到消息 [群组: {group_id}] [用户: {event.user_id}]: {text_content[:50]}...")
     
     image_md5 = None
@@ -151,6 +191,8 @@ async def handle_message(bot: Bot, event: MessageEvent):
         group_id=group_id,
         role="user",
         content=text_content,
+        user_nickname=user_nickname,
+        user_id=user_id,
         image_md5=image_md5,
         timestamp=timestamp,
         display_time=display_time,
@@ -167,9 +209,10 @@ async def handle_message(bot: Bot, event: MessageEvent):
     # 构建上下文并生成回复
     context = await context_builder.build_context(
         group_id=group_id,
-        user_nickname=event.sender.card or event.sender.nickname or "用户",
+        user_nickname=user_nickname,
         current_time=timestamp
     )
+    logger.debug(format_context_for_debug(context))
     response = await chat_client.generate_response(context)
     response = response.strip()  # 去除首尾空格和换行
     
@@ -181,6 +224,8 @@ async def handle_message(bot: Bot, event: MessageEvent):
         group_id=group_id,
         role="ai",
         content=response,
+        user_nickname=None,
+        user_id=str(bot.self_id),
         timestamp=reply_timestamp,
         display_time=reply_display_time,
         weekday=get_weekday_label(reply_timestamp),
@@ -471,8 +516,7 @@ async def handle_help(bot: Bot, event: MessageEvent):
 
 # ================= 生命周期事件 =================
 
-import nonebot
-driver = nonebot.get_driver()
+driver = DRIVER
 
 @driver.on_startup
 async def startup():
@@ -496,5 +540,11 @@ async def startup():
 @driver.on_shutdown
 async def shutdown():
     from tortoise import Tortoise
+    try:
+        conn = Tortoise.get_connection("default")
+        await conn.execute_query("PRAGMA wal_checkpoint(TRUNCATE);")
+        logger.debug("WAL checkpoint completed")
+    except Exception as exc:
+        logger.warning(f"WAL checkpoint failed: {exc}")
     await Tortoise.close_connections()
     logger.debug("数据库连接已关闭")

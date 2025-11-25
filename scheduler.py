@@ -49,8 +49,10 @@ class MemoryScheduler:
         context_lines = []
         for msg in messages:
             role_label = "AI" if msg.role == "ai" else "用户"
+            display_name = msg.user_nickname or role_label
             time_str = f"{msg.timestamp.strftime('%m-%d %H:%M')} {msg.weekday}"
-            context_lines.append(f"[{time_str}] {role_label}: {msg.content}")
+            content = msg.content or "(无文本内容)"
+            context_lines.append(f"[{time_str}] {display_name}: {content}")
         
         context = "\n".join(context_lines)
         

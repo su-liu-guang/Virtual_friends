@@ -2,9 +2,21 @@ import hashlib
 import aiohttp
 from datetime import datetime
 from typing import List, Optional
+from nonebot import logger
 from openai.types.chat import ChatCompletionMessageParam
 from .database import Message, ImageCache, Summary, ImportantEvent
 from .config import ConfigManager
+
+ERROR_CAPTION_PREFIXES = ("[图片识别失败", "[Vision Error")
+
+
+def is_valid_caption(caption: Optional[str]) -> bool:
+    if not caption:
+        return False
+    stripped = caption.strip()
+    if not stripped:
+        return False
+    return not stripped.startswith(ERROR_CAPTION_PREFIXES)
 
 async def process_image_message(image_url: str, vision_client, caption_override: Optional[str] = None, is_sticker: bool = False) -> str:
     """处理图片消息,实现缓存优先策略"""
@@ -27,8 +39,11 @@ async def process_image_message(image_url: str, vision_client, caption_override:
         # 调用 Vision API
         caption = await vision_client.recognize_image(image_url, is_sticker=is_sticker)
     
-    # 写入缓存
-    await ImageCache.create(md5=md5, caption=caption)
+    # 写入缓存（仅在识别结果有效时）
+    if is_valid_caption(caption):
+        await ImageCache.create(md5=md5, caption=caption)
+    else:
+        logger.warning("[Vision] 识别结果无效，已跳过缓存写入（请检查模型是否支持图像识别）")
     
     return md5
 
@@ -83,9 +98,13 @@ class ContextBuilder:
         
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_content.strip()}]
         
-        # Recent Layer - 最近对话
-        # 使用时间+ID双重排序，确保消息顺序绝对正确（防止系统时间回拨等极端情况）
-        recent_msgs = await Message.filter(group_id=group_id).order_by("timestamp", "id").limit(100).all()
+        # Recent Layer - 最近未总结的消息（is_processed=False）
+        recent_msgs = (
+            await Message.filter(group_id=group_id, is_processed=False)
+            .order_by("timestamp", "id")
+            .limit(100)
+            .all()
+        )
         
         for msg in recent_msgs:
             content = msg.content
@@ -96,6 +115,9 @@ class ContextBuilder:
                 if cache:
                     content = f"[系统注解: 图片内容为 {cache.caption}]\n{content}" if content else f"[系统注解: 图片内容为 {cache.caption}]"
             
+            if msg.role == "user" and msg.user_nickname:
+                content = f"{msg.user_nickname}: {content}" if content else f"{msg.user_nickname}: [无文本内容]"
+
             role = "assistant" if msg.role == "ai" else "user"
             message: ChatCompletionMessageParam = {
                 "role": role,  # type: ignore

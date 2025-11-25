@@ -1,7 +1,7 @@
 import random
 import asyncio
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import nonebot
 from nonebot import logger
@@ -136,13 +136,16 @@ class ActiveBehaviorManager:
 			logger.warning(f"[Active] 群 {group_id} 生成的主动消息为空, 已忽略")
 			return
 
-		if await self._deliver_message(group_id, reply):
+		sent, sender_id = await self._deliver_message(group_id, reply)
+		if sent:
 			stored_time = now
 			display_time = now.strftime("%Y-%m-%d %H:%M")
 			await Message.create(
 				group_id=group_id,
 				role="ai",
 				content=reply,
+				user_nickname=None,
+				user_id=sender_id,
 				timestamp=stored_time,
 				display_time=display_time,
 				weekday=weekday_label(stored_time),
@@ -157,11 +160,11 @@ class ActiveBehaviorManager:
 		else:
 			logger.warning(f"[Active] 向群 {group_id} 发送主动消息失败")
 
-	async def _deliver_message(self, group_id: str, content: str) -> bool:
+	async def _deliver_message(self, group_id: str, content: str) -> Tuple[bool, Optional[str]]:
 		driver = nonebot.get_driver()
 		if not driver.bots:
 			logger.warning("[Active] 当前无在线 Bot, 无法主动发言")
-			return False
+			return False, None
 
 		for bot in driver.bots.values():
 			try:
@@ -171,11 +174,11 @@ class ActiveBehaviorManager:
 
 			try:
 				await bot.call_api("send_group_msg", group_id=target, message=content)
-				return True
+				return True, str(bot.self_id)
 			except Exception as exc:
 				logger.debug(f"[Active] Bot({bot.self_id}) 发送失败, 尝试下一个: {exc}")
 				continue
-		return False
+		return False, None
 
 	@staticmethod
 	def _hours_since(timestamp: datetime, now: datetime) -> float:

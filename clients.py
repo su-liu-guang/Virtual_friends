@@ -106,11 +106,6 @@ class ChatClient:
     async def generate_response(self, messages: Sequence[ChatCompletionMessageParam], retry: int = 3) -> str:
         """生成对话回复"""
         logger.info(f"[Chat] 开始生成回复, 上下文消息数: {len(messages)}")
-        logger.debug(f"[Chat] 消息预览:")
-        for i, msg in enumerate(messages[:3]):  # 只显示前3条
-            role = msg.get("role", "unknown")
-            content = str(msg.get("content", ""))[:100]
-            logger.debug(f"  [{i}] {role}: {content}...")
         
         for attempt in range(retry):
             try:
@@ -125,7 +120,15 @@ class ChatClient:
                 
                 result = response.choices[0].message.content or "..."
                 logger.success(f"[Chat] 生成成功: {result[:100]}...")
-                logger.debug(f"[Chat] Token 使用: prompt={response.usage.prompt_tokens if response.usage else 'N/A'}, completion={response.usage.completion_tokens if response.usage else 'N/A'}, total={response.usage.total_tokens if response.usage else 'N/A'}")
+                if response.usage:
+                    prompt_tokens = response.usage.prompt_tokens
+                    completion_tokens = response.usage.completion_tokens
+                    total_tokens = response.usage.total_tokens
+                    logger.info(
+                        f"[Chat] Token 使用: total={total_tokens}, prompt={prompt_tokens}, completion={completion_tokens}"
+                    )
+                else:
+                    logger.info("[Chat] Token 使用: N/A")
                 return result
             
             except Exception as e:
@@ -141,7 +144,14 @@ class ChatClient:
         logger.info(f"[Chat] 开始生成总结, 上下文长度: {len(context)}")
         messages: List[ChatCompletionMessageParam] = [{
             "role": "user",
-            "content": f"总结以下对话,忽略寒暄和无关细节,保留主要事件和讨论点:\n\n{context}"
+            "content": (
+                "总结以下群聊对话，忽略寒暄和无关细节，保留主要事件和讨论点。最多只能输出2条。"
+                "每条总结务必包含：1) 触发时间（可用消息时间或大致时间段）；"
+                "2) 相关发送人昵称（ context 中的前缀已经包含昵称，请沿用）；"
+                "3) 简要内容。"
+                "以列表形式输出，确保可追溯到是谁在什么时候做了什么。\n\n"
+                f"{context}"
+            )
         }]
         return await self.generate_response(messages, retry)
     
@@ -150,7 +160,12 @@ class ChatClient:
         logger.info(f"[Chat] 开始提取事实, 上下文长度: {len(context)}")
         messages: List[ChatCompletionMessageParam] = [{
             "role": "user",
-            "content": f"从以下对话中提取需要长期记忆的用户信息、计划或重要事实。一定要是非常重要的内容,每行一条,无则返回'无',宁缺毋滥:\n\n{context}"
+            "content": (
+                "从以下群聊对话中提取需要长期记忆的关键信息（计划、喜好、承诺、重要事件等）。"
+                "要求：仅保留非常重要的事实；每条必须包含触发时间与发送人昵称；"
+                "用一句话概括事实，格式建议为“[时间][昵称] ... ”。若没有可用事实，返回“无”。\n\n"
+                f"{context}"
+            )
         }]
         
         result = await self.generate_response(messages, retry)

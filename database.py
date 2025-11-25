@@ -15,6 +15,8 @@ class Message(Model):
     group_id = fields.CharField(max_length=50, index=True)
     role = fields.CharField(max_length=10)  # user or ai
     content = fields.TextField()
+    user_nickname = fields.CharField(max_length=64, null=True, description="消息发送者的昵称")
+    user_id = fields.CharField(max_length=32, null=True, description="发送者 QQ 号或 Bot ID")
     image_md5 = fields.CharField(max_length=32, null=True)
     timestamp = fields.DatetimeField(index=True)
     display_time = fields.CharField(max_length=30, null=True, description="人类可读的时间格式 YYYY-MM-DD HH:MM")
