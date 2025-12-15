@@ -22,7 +22,9 @@ class ConfigManager:
             "cooldown_hours": 2,
             "active_check_interval": 45,  # 主动行为检查间隔(分钟)
             "idle_trigger_probability": 0.05,  # 闲聊触发概率
-            "silence_threshold": 24
+            "silence_threshold": 24,
+            "summary_enabled": False,  # 每日总结开关
+            "summary_time": "23:00"    # 每日总结时间
         }
         
     async def initialize(self):
@@ -57,6 +59,22 @@ class ConfigManager:
         
         self.groups = json.loads(self.groups_config_path.read_text(encoding="utf-8"))
         logger.success(f"加载了 {len(self.groups)} 个群组配置")
+
+    async def reload(self):
+        """重新加载配置文件"""
+        logger.info("正在重新加载配置...")
+        try:
+            if self.personas_path.exists():
+                self.personas = json.loads(self.personas_path.read_text(encoding="utf-8"))
+                logger.success(f"重新加载了 {len(self.personas)} 个人设")
+            
+            if self.groups_config_path.exists():
+                self.groups = json.loads(self.groups_config_path.read_text(encoding="utf-8"))
+                logger.success(f"重新加载了 {len(self.groups)} 个群组配置")
+            return True
+        except Exception as e:
+            logger.error(f"重载配置失败: {e}")
+            return False
     
     def _save_groups(self):
         """保存群组配置到文件"""
@@ -154,12 +172,12 @@ class ConfigManager:
         """获取人设提示词"""
         return self.personas.get(persona_name, self.personas["default"])["prompt"]
     
-    def add_persona(self, name: str, prompt: str, description: str) -> bool:
+    def add_persona(self, name: str, prompt: str) -> bool:
         """添加新人设"""
         try:
             self.personas[name] = {
                 "prompt": prompt,
-                "description": description
+                "description": ""
             }
             
             # 保存到文件
@@ -168,7 +186,7 @@ class ConfigManager:
                 encoding="utf-8"
             )
             
-            logger.success(f"添加人设 '{name}': {description}")
+            logger.success(f"添加人设 '{name}'")
             return True
         except Exception as e:
             logger.error(f"添加人设失败: {e}")
@@ -195,7 +213,7 @@ class ConfigManager:
             logger.error(f"删除人设失败: {e}")
             return False
     
-    def update_persona(self, name: str, prompt: Optional[str] = None, description: Optional[str] = None) -> bool:
+    def update_persona(self, name: str, prompt: Optional[str] = None) -> bool:
         """更新人设"""
         try:
             if name not in self.personas:
@@ -204,9 +222,6 @@ class ConfigManager:
             
             if prompt is not None:
                 self.personas[name]["prompt"] = prompt
-            
-            if description is not None:
-                self.personas[name]["description"] = description
             
             # 保存到文件
             self.personas_path.write_text(

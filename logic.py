@@ -50,8 +50,9 @@ async def process_image_message(image_url: str, vision_client, caption_override:
 class ContextBuilder:
     """上下文构建器"""
     
-    def __init__(self, config_manager: ConfigManager):
+    def __init__(self, config_manager: ConfigManager, knowledge_base=None):
         self.config_manager = config_manager
+        self.knowledge_base = knowledge_base
     
     async def build_context(
         self, 
@@ -63,6 +64,34 @@ class ContextBuilder:
         config = self.config_manager.get_instance_config(group_id)
         persona_prompt = self.config_manager.get_persona_prompt(config["persona_name"])
         
+        # Recent Layer - 最近未总结的消息（is_processed=False）
+        # 提前获取以便用于检索
+        recent_msgs = (
+            await Message.filter(group_id=group_id, is_processed=False)
+            .order_by("timestamp", "id")
+            .limit(100)
+            .all()
+        )
+
+        # Knowledge Layer - 知识库检索
+        knowledge_text = ""
+        if self.knowledge_base and recent_msgs:
+            # 找到最后一条用户消息
+            last_user_msg = None
+            for msg in reversed(recent_msgs):
+                if msg.role == "user":
+                    last_user_msg = msg
+                    break
+            
+            if last_user_msg and last_user_msg.content and len(last_user_msg.content) > 2:
+                chunks = await self.knowledge_base.search(last_user_msg.content, top_k=3)
+                if chunks:
+                    knowledge_text = "\n[参考资料]:\n"
+                    for i, chunk in enumerate(chunks):
+                        knowledge_text += f"{i+1}. (来自 {chunk['source']} - {chunk['title']})\n{chunk['text']}\n"
+                    
+                    knowledge_text += "\n[图片发送规则]\n参考资料中可能会提到图片资源，格式为 `(此处有一张图片，名称为：xxx)`。\n如果你认为展示该图片有助于回答用户问题，请在回复的末尾单独一行输出：`{{发送图片:xxx}}`。\n请只发送与问题高度相关的图片。\n"
+
         # 时间信息
         weekday_cn = ["一", "二", "三", "四", "五", "六", "日"]
         weekday = weekday_cn[current_time.isoweekday() - 1]
@@ -73,6 +102,7 @@ class ContextBuilder:
 
 [当前时间]: {time_str}
 [用户称呼]: {user_nickname}
+{knowledge_text}
 """
         
         # Fact Layer - 长期记忆
@@ -98,14 +128,7 @@ class ContextBuilder:
         
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_content.strip()}]
         
-        # Recent Layer - 最近未总结的消息（is_processed=False）
-        recent_msgs = (
-            await Message.filter(group_id=group_id, is_processed=False)
-            .order_by("timestamp", "id")
-            .limit(100)
-            .all()
-        )
-        
+        # Recent Layer - 消息已在上面获取，这里直接使用
         for msg in recent_msgs:
             content = msg.content
             
@@ -115,8 +138,15 @@ class ContextBuilder:
                 if cache:
                     content = f"[系统注解: 图片内容为 {cache.caption}]\n{content}" if content else f"[系统注解: 图片内容为 {cache.caption}]"
             
+            # 添加时间戳 (本地时间)
+            local_ts = msg.timestamp.astimezone()
+            time_prefix = f"[{local_ts.strftime('%Y-%m-%d %H:%M')}] "
+            
             if msg.role == "user" and msg.user_nickname:
-                content = f"{msg.user_nickname}: {content}" if content else f"{msg.user_nickname}: [无文本内容]"
+                content = f"{time_prefix}{msg.user_nickname}: {content}" if content else f"{time_prefix}{msg.user_nickname}: [无文本内容]"
+            elif msg.role == "ai":
+                # AI 的消息也加上时间，保持格式一致
+                content = f"{time_prefix}{content}"
 
             role = "assistant" if msg.role == "ai" else "user"
             message: ChatCompletionMessageParam = {

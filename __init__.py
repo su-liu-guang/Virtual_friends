@@ -1,15 +1,17 @@
 import nonebot
 from nonebot import on_message, on_command, logger, require
 from nonebot.adapters.onebot.v11 import Bot, MessageEvent, GroupMessageEvent, Message as OB11Message
-from nonebot.adapters.onebot.v11.permission import GROUP_OWNER
+from nonebot.adapters.onebot.v11.permission import GROUP_OWNER,GROUP_ADMIN
 from nonebot.permission import SUPERUSER
-from nonebot.exception import MatcherException
+from nonebot.exception import MatcherException, FinishedException
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
 import json
 from datetime import datetime
 import asyncio
 import random
+import re
+from pathlib import Path
 
 from .config import ConfigManager
 from .database import init_db, Message, Summary, ImportantEvent
@@ -17,6 +19,8 @@ from .clients import VisionClient, ChatClient
 from .logic import ContextBuilder, process_image_message
 from .scheduler import MemoryScheduler
 from .active_behavior import ActiveBehaviorManager
+from .summary import DailySummaryGenerator
+from .knowledge import KnowledgeBase
 
 __plugin_meta__ = PluginMetadata(
     name="Virtual Friends",
@@ -30,9 +34,11 @@ __plugin_meta__ = PluginMetadata(
 config_manager = ConfigManager()
 vision_client = VisionClient()
 chat_client = ChatClient()
-context_builder = ContextBuilder(config_manager)
+knowledge_base = KnowledgeBase()
+context_builder = ContextBuilder(config_manager, knowledge_base)
 memory_scheduler = MemoryScheduler(chat_client)
 active_behavior_manager = ActiveBehaviorManager(config_manager, chat_client, context_builder, memory_scheduler)
+daily_summary_generator = DailySummaryGenerator(chat_client, config_manager)
 
 try:
     scheduler = require("nonebot_plugin_apscheduler").scheduler
@@ -55,6 +61,8 @@ KEY_ALIAS = {
     "idle_trigger_probability": "闲聊触发概率",
     "silence_threshold": "沉默阈值(小时)",
     "group_name": "群名称",
+    "summary_enabled": "每日总结开关",
+    "summary_time": "每日总结时间",
 }
 
 # 展示名/中文别名 -> 内部 key
@@ -89,6 +97,14 @@ ALIAS_TO_KEY = {
     # group_name
     "群名称备注": "group_name",
     "group_name": "group_name",
+    # summary_enabled
+    "每日总结开关": "summary_enabled",
+    "summary_enabled": "summary_enabled",
+    "开启每日总结": "summary_enabled",
+    # summary_time
+    "每日总结时间": "summary_time",
+    "summary_time": "summary_time",
+    "总结时间": "summary_time",
 }
 
 # ================= 命令前缀与工具函数 =================
@@ -177,10 +193,10 @@ async def handle_message(bot: Bot, event: MessageEvent):
             if seg.type == "image":
                 image_url = seg.data["url"]
                 summary = seg.data.get("summary", "")
-                is_sticker = summary == "[动画表情]"
-                logger.info(f"检测到图片: {image_url[:50]}... (Summary: {summary})")
+                is_sticker = bool(summary)
+                logger.debug(f"检测到图片: {image_url[:50]}... (Summary: {summary})")
                 image_md5 = await process_image_message(image_url, vision_client, is_sticker=is_sticker)
-                logger.success(f"图片处理完成, MD5: {image_md5}")
+                logger.debug(f"图片处理完成, MD5: {image_md5}")
                 break
     
     timestamp = get_current_time()
@@ -216,6 +232,9 @@ async def handle_message(bot: Bot, event: MessageEvent):
     response = await chat_client.generate_response(context)
     response = response.strip()  # 去除首尾空格和换行
     
+    # 去除可能的时间戳前缀 [2025-12-12 19:30]
+    response = re.sub(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*", "", response)
+    
     # 存储并发送回复
     reply_timestamp = get_current_time()
     reply_display_time = format_display_time(reply_timestamp)
@@ -231,26 +250,54 @@ async def handle_message(bot: Bot, event: MessageEvent):
         weekday=get_weekday_label(reply_timestamp),
         is_processed=False
     )
-    await message_handler.send(response)
+    
+    # 处理图片发送指令
+    # 格式: {{发送图片:xxx}}
+    from nonebot.adapters.onebot.v11 import MessageSegment
+    
+    final_message = OB11Message(response)
+    
+    img_match = re.search(r"\{\{发送图片:(.*?)\}\}", response)
+    if img_match:
+        img_name = img_match.group(1)
+        img_path = knowledge_base.get_image_path(img_name)
+        
+        # 移除指令文本
+        clean_response = response.replace(img_match.group(0), "").strip()
+        final_message = OB11Message(clean_response)
+        
+        if img_path:
+            try:
+                final_message += MessageSegment.image(Path(img_path))
+                logger.info(f"附加图片: {img_name} -> {img_path}")
+            except Exception as e:
+                logger.error(f"图片加载失败: {e}")
+        else:
+            logger.warning(f"未找到图片: {img_name}")
+
+    await message_handler.send(final_message)
     
     # 触发后台任务
     asyncio.create_task(memory_scheduler.check_and_process(group_id))
 
 # ================= 指令注册 =================
 
-switch_persona = on_command("切换人设", aliases={"切换提示词"}, priority=5, block=True)
+switch_persona = on_command("切换人设", aliases={"切换提示词"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
 memory_status = on_command("记忆状态", aliases={"查看记忆"}, priority=5, block=True)
-forget_cmd = on_command("遗忘", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
-clear_memory = on_command("清空记忆", aliases={"重置记忆"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
-persona_list = on_command("提示词列表", aliases={"人设列表"}, permission=SUPERUSER | GROUP_OWNER, priority=5, block=True)
+forget_cmd = on_command("遗忘", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
+clear_memory = on_command("清空记忆", aliases={"重置记忆"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
+persona_list = on_command("提示词列表", aliases={"人设列表"}, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN, priority=5, block=True)
 view_persona = on_command("查看提示词", aliases={"查看人设"}, priority=5, block=True)
-add_persona = on_command("添加提示词", aliases={"添加人设", "增加提示词", "增加人设"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+add_persona = on_command("添加提示词", aliases={"添加人设", "增加提示词", "增加人设"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
 delete_persona = on_command("删除提示词", aliases={"删除人设"}, priority=5, block=True, permission=SUPERUSER)
-enable_plugin = on_command("人生启动", aliases={"世界开启", "故事开始"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
-disable_plugin = on_command("世界终结", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
-view_whitelist = on_command("查看白名单", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
-view_config = on_command("查看配置", aliases={"vf配置", "当前配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
-update_config = on_command("修改配置", aliases={"vf设置", "更新配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER)
+enable_plugin = on_command("人生启动", aliases={"世界开启", "故事开始"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
+disable_plugin = on_command("世界终结", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
+view_whitelist = on_command("查看白名单", priority=5, block=True, permission=SUPERUSER)
+view_config = on_command("查看配置", aliases={"vf配置", "当前配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
+update_config = on_command("修改配置", aliases={"vf设置", "更新配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
+reload_config = on_command("重载配置", aliases={"刷新配置", "重载人设", "刷新人设"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
+daily_summary_cmd = on_command("今日总结", aliases={"群聊日报"}, priority=5, block=True)
+test_summary_cmd = on_command("测试日报", aliases={"历史日报"}, priority=5, block=True, permission=SUPERUSER)
 help_cmd = on_command("vf帮助", aliases={"vf菜单", "vf指令列表"}, priority=5, block=True)
 
 # ================= 指令处理 =================
@@ -270,7 +317,7 @@ async def handle_switch_persona(bot: Bot, event: MessageEvent, args: OB11Message
         await switch_persona.finish(f"人设不存在。可用人设: {', '.join(personas.keys())}")
     
     config_manager.update_instance_config(group_id, {"persona_name": arg_text})
-    await switch_persona.finish(f"已切换至人设: {arg_text}\n描述: {personas[arg_text]['description']}")
+    await switch_persona.finish(f"已切换至人设: {arg_text}")
 
 @memory_status.handle()
 async def handle_memory_status(bot: Bot, event: MessageEvent):
@@ -325,7 +372,7 @@ async def handle_clear_memory(bot: Bot, event: MessageEvent):
 @persona_list.handle()
 async def handle_persona_list(bot: Bot, event: MessageEvent):
     personas = config_manager.get_personas()
-    msg = "\n".join([f"• {k}: {v.get('description', '无')}" for k, v in personas.items()])
+    msg = "\n".join([f"• {k}" for k in personas.keys()])
     await persona_list.finish(f"📝 可用人设:\n{msg}\n使用 /切换人设 [名称] 切换")
 
 @view_persona.handle()
@@ -340,18 +387,18 @@ async def handle_view_persona(bot: Bot, event: MessageEvent, args: OB11Message =
     if not persona:
         await view_persona.finish(f"人设 '{arg_text}' 不存在")
         
-    await view_persona.finish(f"📋 {arg_text} ({persona.get('description')})\n\n{persona.get('prompt')}")
+    await view_persona.finish(f"📋 {arg_text}\n\n{persona.get('prompt')}")
 
 @add_persona.handle()
 async def handle_add_persona(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
     text = args.extract_plain_text().strip()
-    parts = text.split(maxsplit=2)
+    parts = text.split(maxsplit=1)
     
-    if len(parts) < 3:
-        await add_persona.finish("用法: /添加提示词 名称 描述 提示词")
+    if len(parts) < 2:
+        await add_persona.finish("用法: /添加提示词 名称 提示词")
     
-    name, desc, prompt = parts[0], parts[1], parts[2]
-    if config_manager.add_persona(name, prompt, desc):
+    name, prompt = parts[0], parts[1]
+    if config_manager.add_persona(name, prompt):
         await add_persona.finish(f"✅ 已添加人设 '{name}'")
     else:
         await add_persona.finish("❌ 添加失败")
@@ -464,6 +511,8 @@ async def handle_update_config(bot: Bot, event: MessageEvent, args: OB11Message 
         "idle_trigger_probability",
         "silence_threshold",
         "group_name",
+        "summary_enabled",
+        "summary_time",
     }
 
     for raw_key, v in new_config.items():
@@ -490,6 +539,66 @@ async def handle_update_config(bot: Bot, event: MessageEvent, args: OB11Message 
         
     await update_config.finish(f"✅ 配置已更新:\n{json.dumps(aliased_final, ensure_ascii=False, indent=2)}")
 
+@reload_config.handle()
+async def handle_reload_config(bot: Bot, event: MessageEvent):
+    success = await config_manager.reload()
+    if success:
+        await reload_config.finish("✅ 配置已重新加载！")
+    else:
+        await reload_config.finish("❌ 配置重载失败，请检查日志。")
+
+@daily_summary_cmd.handle()
+async def handle_daily_summary(bot: Bot, event: MessageEvent):
+    group_id = get_group_id(event)
+    await daily_summary_cmd.send("正在生成今日群聊日报，请稍候...")
+    
+    try:
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        img = await daily_summary_generator.generate_report(group_id)
+        if img:
+            await daily_summary_cmd.finish(MessageSegment.image(img))
+        else:
+            await daily_summary_cmd.finish("生成日报失败，可能是今日无消息或缺少依赖。")
+    except FinishedException:
+        raise
+    except Exception as e:
+        logger.error(f"生成日报出错: {e}")
+        await daily_summary_cmd.finish(f"生成日报出错: {e}")
+
+@test_summary_cmd.handle()
+async def handle_test_summary(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
+    arg_text = args.extract_plain_text().strip()
+    if not arg_text:
+        await test_summary_cmd.finish("用法: /测试日报 [日期 YYYY-MM-DD] [可选群号]")
+    
+    parts = arg_text.split()
+    date_str = parts[0]
+    
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        await test_summary_cmd.finish("日期格式错误，请使用 YYYY-MM-DD 格式，例如 2023-12-11")
+        
+    if len(parts) > 1:
+        group_id = parts[1]
+    else:
+        group_id = get_group_id(event)
+        
+    await test_summary_cmd.send(f"正在生成群 {group_id} 在 {date_str} 的群聊日报，请稍候...")
+    
+    try:
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        img = await daily_summary_generator.generate_report(group_id, target_date=target_date)
+        if img:
+            await test_summary_cmd.finish(MessageSegment.image(img))
+        else:
+            await test_summary_cmd.finish("生成日报失败，可能是当日无消息或缺少依赖。")
+    except FinishedException:
+        raise
+    except Exception as e:
+        logger.error(f"生成测试日报出错: {e}")
+        await test_summary_cmd.finish(f"生成测试日报出错: {e}")
+
 # --- 帮助信息 ---
 
 @help_cmd.handle()
@@ -497,31 +606,60 @@ async def handle_help(bot: Bot, event: MessageEvent):
     await help_cmd.finish("""🤖 Virtual Friends 指令列表
 ━━━━━━━━━━━━━━
 基础指令:
-• /提示词列表 - 查看所有可用人设
 • /查看提示词 [名称] - 查看指定人设详情
 • /记忆状态 - 查看当前群聊的记忆统计
+• /今日总结 - 生成今日群聊日报
 
-管理指令 (超管/群主)
+管理指令 (超管/群主/管理员):
+• /提示词列表 - 查看所有可用人设
 • /切换人设 [名称] - 切换当前群聊的 AI 人设
-• /人生启动 - 在当前群启用插件 (加入白名单)
-• /世界终结 - 在当前群禁用插件 (移出白名单)
+• /添加提示词 <名称> <内容> - 添加新人设
+• /人生启动 - 在当前群启用插件
+• /世界终结 - 在当前群禁用插件
 • /清空记忆 - 删除当前群的所有记忆数据
 • /遗忘 [关键词] - 删除包含关键词的特定记忆
-• /添加提示词 <名称> <描述> <内容> - 添加新人设
-• /删除提示词 [名称] - 删除指定人设 (仅超管)
-• /查看白名单 - 查看已启用插件的群
 • /查看配置 - 查看当前群组的详细配置
-• /修改配置 <JSON> - 修改当前群组配置""")
+• /修改配置 <JSON> - 修改当前群组配置
+• /重载配置 - 重新加载配置文件
+
+超管指令:
+• /删除提示词 [名称] - 删除指定人设
+• /查看白名单 - 查看已启用插件的群
+• /测试日报 [日期] - 生成指定日期的日报""")
 
 
 # ================= 生命周期事件 =================
 
 driver = DRIVER
 
+async def check_daily_summary():
+    """检查并发送每日总结"""
+    now = datetime.now()
+    current_time_str = now.strftime("%H:%M")
+    
+    # 获取所有群组配置
+    for group_id, config in config_manager.groups.items():
+        if not config.get("summary_enabled"):
+            continue
+            
+        target_time = config.get("summary_time", "23:00")
+        if target_time == current_time_str:
+            logger.info(f"触发群 {group_id} 每日总结")
+            try:
+                # 尝试获取 bot 实例
+                bot = nonebot.get_bot()
+                from nonebot.adapters.onebot.v11 import MessageSegment
+                img = await daily_summary_generator.generate_report(group_id)
+                if img:
+                    await bot.send_group_msg(group_id=int(group_id), message=MessageSegment.image(img))
+            except Exception as e:
+                logger.error(f"发送群 {group_id} 每日总结失败: {e}")
+
 @driver.on_startup
 async def startup():
     await init_db()
     await config_manager.initialize()
+    await knowledge_base.initialize()
     if scheduler:
         try:
             scheduler.add_job(
@@ -533,12 +671,23 @@ async def startup():
                 max_instances=1,
                 coalesce=True,
             )
+            scheduler.add_job(
+                check_daily_summary,
+                "cron",
+                minute="*",
+                id="virtual_friends_daily_summary",
+                replace_existing=True
+            )
+            logger.success("定时任务已启动")
+        except Exception as e:
+            logger.error(f"启动定时任务失败: {e}")
             logger.info("主动行为调度已启动, 基础心跳 1 分钟")
         except Exception as exc:
             logger.error(f"主动行为调度启动失败: {exc}")
 
 @driver.on_shutdown
 async def shutdown():
+    # 1. 关闭数据库连接
     from tortoise import Tortoise
     try:
         conn = Tortoise.get_connection("default")
@@ -548,3 +697,16 @@ async def shutdown():
         logger.warning(f"WAL checkpoint failed: {exc}")
     await Tortoise.close_connections()
     logger.debug("数据库连接已关闭")
+
+    # 2. 尝试优雅关闭 htmlrender 浏览器 (消除 Ctrl+C 报错)
+    try:
+        import nonebot.plugin
+        if nonebot.plugin.get_plugin("nonebot_plugin_htmlrender"):
+            from nonebot_plugin_htmlrender import get_browser
+            browser = await get_browser()
+            if browser and browser.is_connected():
+                await browser.close()
+                logger.debug("HtmlRender 浏览器已手动关闭")
+    except Exception:
+        # 忽略所有浏览器关闭异常
+        pass

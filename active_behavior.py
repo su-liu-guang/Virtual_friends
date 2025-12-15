@@ -1,6 +1,7 @@
 import random
 import asyncio
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
 import nonebot
@@ -132,6 +133,10 @@ class ActiveBehaviorManager:
 		context.append({"role": "user", "content": prompt})
 
 		reply = (await self.chat_client.generate_response(context)).strip()
+		
+		# 去除可能的时间戳前缀 [2025-12-12 19:30]
+		reply = re.sub(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*", "", reply)
+		
 		if not reply:
 			logger.warning(f"[Active] 群 {group_id} 生成的主动消息为空, 已忽略")
 			return
@@ -182,7 +187,18 @@ class ActiveBehaviorManager:
 
 	@staticmethod
 	def _hours_since(timestamp: datetime, now: datetime) -> float:
-		delta = now - timestamp
+		# 确保存储的时间戳转换为本地时间进行比较
+		if timestamp.tzinfo is None:
+			# 如果是 naive 时间，假设它是 UTC (Tortoise 默认) 并转换为本地
+			# 或者如果项目约定 naive 就是本地，则直接加上本地时区
+			# 这里为了稳妥，先将其视为 UTC (如果数据库存的是 UTC)
+			# 但通常 Tortoise 取出的 DatetimeField 是 aware 的 (如果配置了时区)
+			# 最安全的做法是统一转为 astimezone()
+			ts = timestamp.replace(tzinfo=timezone.utc).astimezone()
+		else:
+			ts = timestamp.astimezone()
+			
+		delta = now - ts
 		return delta.total_seconds() / 3600
 
 	@staticmethod

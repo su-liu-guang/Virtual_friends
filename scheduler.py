@@ -50,7 +50,9 @@ class MemoryScheduler:
         for msg in messages:
             role_label = "AI" if msg.role == "ai" else "用户"
             display_name = msg.user_nickname or role_label
-            time_str = f"{msg.timestamp.strftime('%m-%d %H:%M')} {msg.weekday}"
+            # 转换为本地时间
+            local_timestamp = msg.timestamp.astimezone()
+            time_str = f"{local_timestamp.strftime('%Y-%m-%d %H:%M')} {msg.weekday}"
             content = msg.content or "(无文本内容)"
             context_lines.append(f"[{time_str}] {display_name}: {content}")
         
@@ -72,8 +74,8 @@ class MemoryScheduler:
         """生成 L1 摘要"""
         summary_text = await self.chat_client.generate_summary(context)
         
-        start_time = messages[0].timestamp
-        end_time = messages[-1].timestamp
+        start_time = messages[0].timestamp.astimezone()
+        end_time = messages[-1].timestamp.astimezone()
         time_range = f"{start_time.strftime('%Y.%m.%d')}-{end_time.strftime('%m.%d')}"
         
         await Summary.create(

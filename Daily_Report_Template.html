@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QQ群聊日报-波普游戏风</title>
+    <script>
+        // 屏蔽 Tailwind CSS 的生产环境警告
+        const originalWarn = console.warn;
+        console.warn = function(...args) {
+            if (args[0] && typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com should not be used in production')) return;
+            originalWarn.apply(console, args);
+        };
+    </script>
+    <script src="{{ static_path }}/tailwindcss.js"></script>
+    <script src="{{ static_path }}/lucide.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;700;900&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Noto Sans SC', sans-serif;
+            background-color: #f0f0f0;
+        }
+        
+        /* 方格背景纹理 */
+        .bg-grid-pattern {
+            background-color: #fffbeb; /* 淡淡的米黄色 */
+            background-image: 
+                linear-gradient(#e5e7eb 1px, transparent 1px),
+                linear-gradient(90deg, #e5e7eb 1px, transparent 1px);
+            background-size: 20px 20px;
+        }
+
+        /* 波普风硬阴影 */
+        .pop-shadow {
+            box-shadow: 4px 4px 0px 0px #000000;
+        }
+        .pop-shadow-sm {
+            box-shadow: 2px 2px 0px 0px #000000;
+        }
+
+        /* 虚线边框 */
+        .dashed-border {
+            background-image: url("data:image/svg+xml,%3csvg width='100%25' height='100%25' xmlns='http://www.w3.org/2000/svg'%3e%3crect width='100%25' height='100%25' fill='none' rx='12' ry='12' stroke='%23333' stroke-width='2' stroke-dasharray='6%2c 6' stroke-dashoffset='0' stroke-linecap='square'/%3e%3c/svg%3e");
+            border-radius: 12px;
+        }
+
+        /* 隐藏滚动条 */
+        ::-webkit-scrollbar { display: none; }
+    </style>
+</head>
+<body class="flex justify-center py-10">
+
+    <!-- 截图区域：固定宽度 520px (适合手机阅读)，高度自适应 -->
+    <div id="capture-node" class="w-[520px] bg-grid-pattern border-4 border-black relative overflow-hidden">
+        
+        <!-- 装饰：顶部的彩带 -->
+        <div class="h-4 w-full flex">
+            <div class="w-1/4 bg-red-400 border-r-2 border-black"></div>
+            <div class="w-1/4 bg-yellow-400 border-r-2 border-black"></div>
+            <div class="w-1/4 bg-blue-400 border-r-2 border-black"></div>
+            <div class="w-1/4 bg-green-400"></div>
+        </div>
+
+        <!-- 1. 标题区 -->
+        <div class="p-8 pb-4 relative">
+            <!-- 运势模块 -->
+            {% if fortune %}
+            <div class="absolute top-6 right-6 bg-white border-2 border-black p-3 rotate-3 pop-shadow-sm max-w-[140px] z-10 transform hover:scale-105 transition-transform">
+                <div class="text-[10px] font-bold text-gray-500 uppercase tracking-wider border-b border-gray-200 pb-1 mb-1">Today's Fortune</div>
+                <div class="text-2xl font-black text-red-500 leading-none mb-1">{{ fortune.luck }}</div>
+                <div class="text-[10px] font-bold text-gray-800 leading-tight">{{ fortune.text }}</div>
+            </div>
+            {% endif %}
+
+            <h1 class="text-4xl font-black tracking-tighter mb-2 italic relative z-0">
+                <span class="bg-clip-text text-transparent bg-gradient-to-r from-pink-600 via-red-500 to-yellow-500" style="filter: drop-shadow(2px 2px 0px rgba(0,0,0,1)); -webkit-text-stroke: 1px black;">
+                    今日群聊<br>迷惑大赏
+                </span>
+            </h1>
+            <div class="inline-block bg-black text-white px-3 py-1 text-sm font-bold rotate-[-2deg] pop-shadow-sm">
+                📅 {{ date }} · {{ group_name }}
+            </div>
+        </div>
+
+        <!-- 2. 数据仪表盘 (Loot Box 风格) -->
+        <div class="px-6 mb-8">
+            <div class="grid grid-cols-2 gap-4">
+                {% for stat in stats %}
+                <!-- Box {{ loop.index }} -->
+                <div class="bg-white border-2 border-black p-3 pop-shadow flex items-center gap-3 hover:translate-x-[2px] hover:translate-y-[2px] hover:shadow-none transition-all">
+                    <div class="bg-{{ stat.color }}-100 p-2 rounded border-2 border-black">
+                        {% if loop.index == 1 %}
+                        <i data-lucide="crown" class="w-6 h-6 text-{{ stat.color }}-600"></i>
+                        {% elif loop.index == 2 %}
+                        <i data-lucide="repeat" class="w-6 h-6 text-{{ stat.color }}-600"></i>
+                        {% elif loop.index == 3 %}
+                        <i data-lucide="moon" class="w-6 h-6 text-{{ stat.color }}-600"></i>
+                        {% else %}
+                        <i data-lucide="bar-chart-3" class="w-6 h-6 text-{{ stat.color }}-600"></i>
+                        {% endif %}
+                    </div>
+                    <div>
+                        <div class="text-[10px] font-bold text-gray-500 uppercase">{{ stat.label }}</div>
+                        <div class="font-black text-lg leading-none">{{ stat.value }}</div>
+                        <div class="text-[10px] text-gray-400">{{ stat.desc }}</div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <!-- 3. 24H 活跃心电图 (简化版) -->
+        <div class="px-6 mb-8">
+            <div class="bg-white border-2 border-black p-4 pop-shadow relative overflow-hidden">
+                <div class="flex justify-between items-end mb-2">
+                    <h3 class="font-black text-lg flex items-center gap-2">
+                        <i data-lucide="activity" class="w-5 h-5"></i>
+                        活跃心电图
+                    </h3>
+                    <span class="text-xs font-bold bg-gray-200 px-2 py-0.5 rounded">24H 趋势</span>
+                </div>
+                <!-- 模拟柱状图 -->
+                <div class="flex items-end justify-between h-24 gap-1 pt-4 border-b-2 border-black">
+                    {% for height in activity_trend %}
+                    <div class="w-full bg-blue-200 border-t-2 border-x-2 border-black h-[{{ height }}%]"></div>
+                    {% endfor %}
+                </div>
+                <div class="flex justify-between text-[10px] font-bold text-gray-400 mt-1">
+                    <span>00:00</span>
+                    <span>06:00</span>
+                    <span>12:00</span>
+                    <span>18:00</span>
+                    <span>23:59</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 4. 今日话题榜 (优化排版) -->
+        <div class="px-6 mb-8">
+            <div class="dashed-border p-5 relative bg-white/50">
+                <div class="absolute -top-3 left-4 bg-white px-2 font-black text-lg border-2 border-black -rotate-2 text-pink-500 pop-shadow-sm">
+                    🔥 热门话题榜
+                </div>
+
+                <div class="space-y-6 mt-4">
+                    {% for topic in topics %}
+                    <div class="relative pl-4 border-l-4 border-gray-300">
+                        <div class="flex justify-between items-start mb-1">
+                            <h4 class="font-black text-lg text-black leading-tight w-3/4">
+                                {{ topic.title }}
+                            </h4>
+                            <div class="font-black text-2xl text-gray-200 italic absolute right-0 top-0 -z-10">#{{ loop.index }}</div>
+                        </div>
+                        
+                        <!-- 热度条 -->
+                        <div class="flex items-center gap-2 mb-2">
+                            <div class="flex-1 h-2 bg-gray-200 rounded-full border border-black overflow-hidden">
+                                <div class="h-full bg-gradient-to-r from-yellow-400 to-red-500 border-r border-black" style="width: {{ (topic.hot / 5) * 100 }}%"></div>
+                            </div>
+                            <div class="text-xs font-bold text-red-500">HOT {{ topic.hot }}</div>
+                        </div>
+
+                        <p class="text-sm text-gray-700 leading-relaxed text-justify">
+                            {{ topic.summary | safe }}
+                        </p>
+                        
+                        <!-- 参与者头像 (如果有) -->
+                        {% if topic.users_qq %}
+                        <div class="flex -space-x-2 overflow-hidden mt-2 pt-2 border-t border-dashed border-gray-300">
+                            {% for qq in topic.users_qq %}
+                            <img class="inline-block h-6 w-6 rounded-full ring-2 ring-white bg-gray-200" src="http://q1.qlogo.cn/g?b=qq&nk={{ qq }}&s=100" alt="">
+                            {% endfor %}
+                        </div>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <!-- 5. 群友图鉴 (战斗力卡片风格) -->
+        <div class="px-6 mb-8">
+            <div class="flex items-center gap-2 mb-6">
+                <i data-lucide="swords" class="w-5 h-5"></i>
+                <h3 class="font-black text-lg">群友战斗力榜</h3>
+            </div>
+
+            <div class="grid grid-cols-1 gap-8"> <!-- 增加间距以适应头像破格 -->
+                
+                {% for user in users %}
+                <!-- Card {{ loop.index }} -->
+                <div class="relative mx-2">
+                    <div class="bg-white border-2 border-black p-4 pt-8 pop-shadow relative">
+                        <!-- 破格头像 -->
+                        <div class="absolute -top-6 left-4 w-16 h-16 rounded-full border-2 border-black overflow-hidden bg-gray-200 z-10 shadow-md">
+                             <img src="http://q1.qlogo.cn/g?b=qq&nk={{ user.qq }}&s=640" class="w-full h-full object-cover">
+                        </div>
+                        <!-- 称号标签 -->
+                        <div class="absolute -top-3 right-4 bg-yellow-300 border-2 border-black px-2 py-0.5 text-xs font-black rotate-2 z-10">
+                            {{ user.title }}
+                        </div>
+
+                        <!-- 内容 -->
+                        <div class="ml-14 pl-2">
+                             <div class="font-black text-xl leading-none mb-2">{{ user.name }}</div>
+                             
+                             <!-- 数据标签 -->
+                             <div class="flex flex-wrap gap-1.5 mb-3">
+                                 <span class="text-[10px] font-bold bg-blue-100 border border-black px-1.5 py-0.5 rounded">
+                                     💬 发言 {{ user.stats.msg }}
+                                 </span>
+                                 <span class="text-[10px] font-bold bg-green-100 border border-black px-1.5 py-0.5 rounded">
+                                     📝 字数 {{ user.stats.len }}
+                                 </span>
+                             </div>
+
+                             <div class="text-sm italic text-gray-600 border-t border-dashed border-gray-300 pt-2 relative">
+                                <span class="text-2xl text-gray-300 absolute -top-2 -left-1">“</span>
+                                {{ user.desc }}
+                                <span class="text-2xl text-gray-300 absolute -bottom-4 -right-1">”</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+
+            </div>
+        </div>
+
+        <!-- 6. 圣经/神回复 (气泡对话风格) -->
+        <div class="px-6 mb-10">
+            <div class="bg-black text-white p-4 pop-shadow-sm border-2 border-black relative">
+                <!-- 装饰夹子 -->
+                <div class="absolute -top-3 left-1/2 -translate-x-1/2 w-8 h-8 bg-gray-300 rounded-full border-2 border-black z-10 flex items-center justify-center">
+                    <div class="w-2 h-2 bg-black rounded-full"></div>
+                </div>
+
+                <h3 class="text-center font-black text-yellow-400 text-lg mb-6 tracking-widest">⚠️ 群聊圣经 ⚠️</h3>
+
+                <div class="space-y-5">
+                    {% for quote in quotes %}
+                    <div class="flex gap-3 items-end {{ 'flex-row-reverse' if loop.index % 2 == 0 else '' }}">
+                        <!-- 头像 -->
+                        <div class="w-10 h-10 rounded-full border-2 border-white overflow-hidden flex-shrink-0 bg-gray-700 shadow-sm">
+                             <img src="http://q1.qlogo.cn/g?b=qq&nk={{ quote.qq }}&s=100" class="w-full h-full">
+                        </div>
+                        
+                        <!-- 气泡 -->
+                        <div class="relative bg-white text-black border-2 border-white p-3 rounded-2xl {{ 'rounded-br-none' if loop.index % 2 == 0 else 'rounded-bl-none' }} shadow-lg max-w-[80%]">
+                            <div class="text-[10px] font-bold text-gray-400 mb-1 {{ 'text-right' if loop.index % 2 == 0 else '' }}">{{ quote.user }}</div>
+                            <div class="text-sm font-bold leading-snug">
+                                {{ quote.content }}
+                            </div>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <!-- 底部 Footer -->
+        <div class="h-6 bg-black flex items-center justify-between px-4 text-[10px] text-white font-mono">
+            <span>CODE: 200 OK</span>
+            <span>POWERED BY VIRTUAL-FRIENDS</span>
+        </div>
+
+    </div>
+
+    <script>
+        lucide.createIcons();
+    </script>
+</body>
+</html>
+
+
