@@ -7,8 +7,9 @@ from .database import Message, Summary, ImportantEvent
 class MemoryScheduler:
     """后台记忆整理调度器"""
     
-    def __init__(self, chat_client):
+    def __init__(self, chat_client, memory_retriever=None):
         self.chat_client = chat_client
+        self.memory_retriever = memory_retriever
         self.processing_groups = set()
     
     async def check_and_process(self, group_id: str):
@@ -78,23 +79,29 @@ class MemoryScheduler:
         end_time = messages[-1].timestamp.astimezone()
         time_range = f"{start_time.strftime('%Y.%m.%d')}-{end_time.strftime('%m.%d')}"
         
-        await Summary.create(
+        summary = await Summary.create(
             group_id=group_id,
             level=1,
             content=summary_text,
             time_range=time_range
         )
+
+        if self.memory_retriever:
+            asyncio.create_task(self.memory_retriever.upsert_summary(summary))
     
     async def _extract_facts(self, group_id: str, context: str):
         """提取并存储重要事实"""
         facts = await self.chat_client.extract_facts(context)
         
         for fact in facts:
-            await ImportantEvent.create(
+            event = await ImportantEvent.create(
                 group_id=group_id,
                 event_content=fact,
                 recorded_date=datetime.now().date()
             )
+
+            if self.memory_retriever:
+                asyncio.create_task(self.memory_retriever.upsert_fact(event))
     
     async def _check_archive(self, group_id: str):
         """检查并执行归档"""

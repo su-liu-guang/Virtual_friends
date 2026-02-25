@@ -15,12 +15,13 @@ from pathlib import Path
 
 from .config import ConfigManager
 from .database import init_db, Message, Summary, ImportantEvent
-from .clients import VisionClient, ChatClient
+from .clients import VisionClient, ChatClient, EmbeddingClient
 from .logic import ContextBuilder, process_image_message
 from .scheduler import MemoryScheduler
 from .active_behavior import ActiveBehaviorManager
 from .summary import DailySummaryGenerator
 from .knowledge import KnowledgeBase
+from .memory_retriever import MemoryRetriever
 
 __plugin_meta__ = PluginMetadata(
     name="Virtual Friends",
@@ -34,9 +35,11 @@ __plugin_meta__ = PluginMetadata(
 config_manager = ConfigManager()
 vision_client = VisionClient()
 chat_client = ChatClient()
+embedding_client = EmbeddingClient()
 knowledge_base = KnowledgeBase()
-context_builder = ContextBuilder(config_manager, knowledge_base)
-memory_scheduler = MemoryScheduler(chat_client)
+memory_retriever = MemoryRetriever(embedding_client, config_manager)
+context_builder = ContextBuilder(config_manager, knowledge_base, memory_retriever)
+memory_scheduler = MemoryScheduler(chat_client, memory_retriever)
 active_behavior_manager = ActiveBehaviorManager(config_manager, chat_client, context_builder, memory_scheduler)
 daily_summary_generator = DailySummaryGenerator(chat_client, config_manager)
 
@@ -299,6 +302,7 @@ reload_config = on_command("重载配置", aliases={"刷新配置", "重载人�
 daily_summary_cmd = on_command("今日总结", aliases={"群聊日报"}, priority=5, block=True)
 test_summary_cmd = on_command("测试日报", aliases={"历史日报"}, priority=5, block=True, permission=SUPERUSER)
 help_cmd = on_command("vf帮助", aliases={"vf菜单", "vf指令列表"}, priority=5, block=True)
+backfill_vectors_cmd = on_command("回填记忆向量", priority=5, block=True, permission=SUPERUSER)
 
 # ================= 指令处理 =================
 
@@ -625,7 +629,42 @@ async def handle_help(bot: Bot, event: MessageEvent):
 超管指令:
 • /删除提示词 [名称] - 删除指定人设
 • /查看白名单 - 查看已启用插件的群
-• /测试日报 [日期] - 生成指定日期的日报""")
+• /测试日报 [日期] - 生成指定日期的日报
+• /回填记忆向量 - 补写历史摘要/事实的向量""")
+
+
+@backfill_vectors_cmd.handle()
+async def handle_backfill_vectors(bot: Bot, event: MessageEvent):
+    if not memory_retriever:
+        await backfill_vectors_cmd.finish("❌ 未启用记忆向量功能")
+
+    await backfill_vectors_cmd.send("⏳ 开始回填历史摘要与事实向量，请稍候...")
+
+    # 回填 Summary
+    summary_count = 0
+    last_id = 0
+    while True:
+        batch = await Summary.filter(id__gt=last_id).order_by("id").limit(100).all()
+        if not batch:
+            break
+        for s in batch:
+            await memory_retriever.upsert_summary(s)
+        summary_count += len(batch)
+        last_id = batch[-1].id
+
+    # 回填 ImportantEvent
+    fact_count = 0
+    last_fact_id = 0
+    while True:
+        batch = await ImportantEvent.filter(id__gt=last_fact_id).order_by("id").limit(100).all()
+        if not batch:
+            break
+        for f in batch:
+            await memory_retriever.upsert_fact(f)
+        fact_count += len(batch)
+        last_fact_id = batch[-1].id
+
+    await backfill_vectors_cmd.finish(f"✅ 回填完成：摘要 {summary_count} 条，事实 {fact_count} 条")
 
 
 # ================= 生命周期事件 =================

@@ -249,6 +249,8 @@ class EmbeddingClient:
         self.api_key = config.get_env("embedding_api_key")
         self.base_url = config.get_env("embedding_api_url")
         self.model = config.get_env("embedding_model_name", "Qwen/Qwen3-Embedding-8B")
+        # 部分提供商限制输入 <8192 tokens，这里用字符数硬截断规避 413
+        self.max_length = int(config.get_env("embedding_max_chars", "8000") or 8000)
         
         if not self.api_key or not self.base_url:
             logger.warning("Embedding Client 配置不完整，知识库功能可能受限。请检查 .env.dev 文件中的 embedding_api_key 和 embedding_api_url")
@@ -257,6 +259,14 @@ class EmbeddingClient:
             api_key=self.api_key or "dummy",
             base_url=self.base_url or "https://api.openai.com/v1"
         )
+
+    def _truncate(self, text: str) -> str:
+        if len(text) <= self.max_length:
+            return text
+        logger.warning(
+            f"[Embedding] 输入过长({len(text)} chars)，截断为 {self.max_length} chars 以满足接口限制"
+        )
+        return text[: self.max_length]
     
     async def get_embedding(self, text: str, retry: int = 3) -> List[float]:
         """获取文本的向量表示"""
@@ -264,12 +274,18 @@ class EmbeddingClient:
         if not text or not text.strip():
             return []
 
+        safe_text = self._truncate(text.strip())
+        logger.debug(f"[Embedding] 开始向量化，model={self.model}, len={len(safe_text)}")
+
         for attempt in range(retry):
             try:
                 # logger.debug(f"[Embedding] 获取向量: {text[:20]}...")
                 response = await self.client.embeddings.create(
-                    input=text,
+                    input=safe_text,
                     model=self.model
+                )
+                logger.debug(
+                    f"[Embedding] 成功 (attempt={attempt + 1}/{retry}), prompt_len={len(safe_text)}"
                 )
                 return response.data[0].embedding
             except Exception as e:

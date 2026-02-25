@@ -7,12 +7,15 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Set
 from nonebot import logger
 from .clients import EmbeddingClient
+from .config import ConfigManager
+from .memory_retriever import RerankerClient
 
 class KnowledgeBase:
     def __init__(self):
         self.base_path = Path("data/Virtual_friends/knowledge")
         self.index_path = self.base_path / "knowledge_index.json"
         self.embedding_client = EmbeddingClient()
+        self.reranker = RerankerClient(ConfigManager())
         
         # 内存中的索引
         self.chunks: List[Dict] = []
@@ -201,8 +204,8 @@ class KnowledgeBase:
         self.index_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-    async def search(self, query: str, top_k: int = 3) -> List[Dict]:
-        """搜索相关片段"""
+    async def search(self, query: str, top_k: int = 3, min_score: float = 0.28) -> List[Dict]:
+        """搜索相关片段，低于阈值则视为不相关，避免乱插参考资料；可选 rerank 优化排序"""
         if not self.chunks:
             return []
             
@@ -216,9 +219,38 @@ class KnowledgeBase:
             score = self._cosine_similarity(query_embedding, chunk["embedding"])
             scored_chunks.append((score, chunk))
             
-        # 排序
+        # 基于向量的初步排序
         scored_chunks.sort(key=lambda x: x[0], reverse=True)
-        
+        if not scored_chunks:
+            return []
+
+        # 阈值过滤
+        best_score = scored_chunks[0][0]
+        if best_score < min_score:
+            logger.debug(
+                f"[Knowledge] 最高相似度 {best_score:.3f} < 阈值 {min_score}, 不插入参考资料"
+            )
+            return []
+
+        # 可选重排序
+        if self.reranker.enabled:
+            candidates = scored_chunks[: max(top_k * 3, 6)]
+            docs = [c[1]["text"] for c in candidates]
+            logger.debug(
+                f"[Knowledge] Reranker 启用，候选={len(docs)} query_len={len(query)}"
+            )
+            rerank_scores = await self.reranker.rerank(query, docs)
+            if rerank_scores and len(rerank_scores) == len(docs):
+                logger.info("[Knowledge] Reranker 成功，采用重排序结果")
+                reranked = sorted(
+                    zip(rerank_scores, candidates), key=lambda x: x[0], reverse=True
+                )
+                scored_chunks = [item[1] for item in reranked]
+            else:
+                logger.warning("[Knowledge] Reranker 失败或返回数量不匹配，沿用向量排序")
+        else:
+            logger.debug("[Knowledge] Reranker 未启用，沿用向量排序")
+
         return [item[1] for item in scored_chunks[:top_k]]
 
     def _cosine_similarity(self, v1: List[float], v2: List[float]) -> float:

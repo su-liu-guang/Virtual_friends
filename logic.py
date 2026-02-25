@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Optional
 from nonebot import logger
 from openai.types.chat import ChatCompletionMessageParam
-from .database import Message, ImageCache, Summary, ImportantEvent
+from .database import Message, ImageCache
 from .config import ConfigManager
 
 ERROR_CAPTION_PREFIXES = ("[图片识别失败", "[Vision Error")
@@ -50,9 +50,10 @@ async def process_image_message(image_url: str, vision_client, caption_override:
 class ContextBuilder:
     """上下文构建器"""
     
-    def __init__(self, config_manager: ConfigManager, knowledge_base=None):
+    def __init__(self, config_manager: ConfigManager, knowledge_base=None, memory_retriever=None):
         self.config_manager = config_manager
         self.knowledge_base = knowledge_base
+        self.memory_retriever = memory_retriever
     
     async def build_context(
         self, 
@@ -73,24 +74,32 @@ class ContextBuilder:
             .all()
         )
 
-        # Knowledge Layer - 知识库检索
+        # Knowledge & Memory Layer
         knowledge_text = ""
-        if self.knowledge_base and recent_msgs:
-            # 找到最后一条用户消息
-            last_user_msg = None
+        memory_hits = []
+        last_user_msg = None
+        if recent_msgs:
             for msg in reversed(recent_msgs):
                 if msg.role == "user":
                     last_user_msg = msg
                     break
-            
-            if last_user_msg and last_user_msg.content and len(last_user_msg.content) > 2:
-                chunks = await self.knowledge_base.search(last_user_msg.content, top_k=3)
-                if chunks:
-                    knowledge_text = "\n[参考资料]:\n"
-                    for i, chunk in enumerate(chunks):
-                        knowledge_text += f"{i+1}. (来自 {chunk['source']} - {chunk['title']})\n{chunk['text']}\n"
-                    
-                    knowledge_text += "\n[图片发送规则]\n参考资料中可能会提到图片资源，格式为 `(此处有一张图片，名称为：xxx)`。\n如果你认为展示该图片有助于回答用户问题，请在回复的末尾单独一行输出：`{{发送图片:xxx}}`。\n请只发送与问题高度相关的图片。\n"
+
+        if self.knowledge_base and last_user_msg and last_user_msg.content and len(last_user_msg.content) > 2:
+            chunks = await self.knowledge_base.search(last_user_msg.content, top_k=1)
+            if chunks:
+                knowledge_text = "\n[参考资料]:\n"
+                for i, chunk in enumerate(chunks):
+                    knowledge_text += f"{i+1}. (来自 {chunk['source']} - {chunk['title']})\n{chunk['text']}\n"
+                
+                knowledge_text += "\n[图片发送规则]\n参考资料中可能会提到图片资源，格式为 `(此处有一张图片，名称为：xxx)`。\n如果你认为展示该图片有助于回答用户问题，请在回复的末尾单独一行输出：`{{发送图片:xxx}}`。\n请只发送与问题高度相关的图片。\n"
+
+        if self.memory_retriever and last_user_msg and last_user_msg.content and len(last_user_msg.content) > 2:
+            memory_hits = await self.memory_retriever.retrieve(
+                group_id,
+                last_user_msg.content,
+                top_k=12,
+                final_k=5
+            )
 
         # 时间信息
         weekday_cn = ["一", "二", "三", "四", "五", "六", "日"]
@@ -105,26 +114,11 @@ class ContextBuilder:
 {knowledge_text}
 """
         
-        # Fact Layer - 长期记忆
-        facts = await ImportantEvent.filter(group_id=group_id, validity=True).all()
-        if facts:
-            facts_text = "\n".join([f"- {f.event_content}" for f in facts])
-            system_content += f"\n[已知事实]:\n{facts_text}\n"
-        
-        # Memory Layer - 流式记忆
-        l3_summaries = await Summary.filter(group_id=group_id, level=3).all()
-        l2_summaries = await Summary.filter(group_id=group_id, level=2, is_archived=False).all()
-        l1_summaries = await Summary.filter(group_id=group_id, level=1, is_archived=False).all()
-        
-        if l3_summaries or l2_summaries or l1_summaries:
+        # Memory Layer - 使用检索结果，减少 token
+        if memory_hits:
             system_content += "\n[记忆回顾]:\n"
-            
-            for s in l3_summaries:
-                system_content += f"[宏观印象 {s.time_range}]: {s.content}\n"
-            for s in l2_summaries:
-                system_content += f"[叙事概括 {s.time_range}]: {s.content}\n"
-            for s in l1_summaries:
-                system_content += f"[细节摘要 {s.time_range}]: {s.content}\n"
+            for item in memory_hits:
+                system_content += f"- ({item['tag']}) {item['content']}\n"
         
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_content.strip()}]
         
