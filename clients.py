@@ -1,5 +1,5 @@
 import asyncio
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from nonebot import logger
@@ -88,14 +88,14 @@ class ChatClient:
             base_url=self.base_url or "https://api.openai.com/v1"
         )
     
-    async def generate_response(self, messages: Sequence[ChatCompletionMessageParam], retry: int = 3) -> str:
+    async def generate_response(self, messages: Sequence[ChatCompletionMessageParam], retry: int = 3) -> Optional[str]:
         """生成对话回复"""
         
         kwargs = {
             "model": self.model,
             "messages": messages,
             "temperature": 0.8,
-            "extra_body":{"enable_thinking": True}
+            "extra_body":{}
         }
         
         for attempt in range(retry):
@@ -121,12 +121,13 @@ class ChatClient:
             except Exception as e:
                 logger.error(f"[Chat] 生成失败 (尝试 {attempt + 1}/{retry}): {type(e).__name__}: {str(e)}")
                 if attempt == retry - 1:
-                    return "抱歉,我现在有点累了,稍后再聊吧..."
+                    logger.error("[Chat] 已达到最大重试次数，放弃本次生成")
+                    return None
                 await asyncio.sleep(2 ** attempt)
         
-        return "抱歉,我现在有点累了,稍后再聊吧..."
+        return None
     
-    async def generate_summary(self, context: str, retry: int = 3) -> str:
+    async def generate_summary(self, context: str, retry: int = 3) -> Optional[str]:
         """生成总结"""
         logger.info(f"[Chat] 开始生成总结, 上下文长度: {len(context)}")
         messages: List[ChatCompletionMessageParam] = [{
@@ -140,7 +141,10 @@ class ChatClient:
                 f"{context}"
             )
         }]
-        return await self.generate_response(messages, retry)
+        result = await self.generate_response(messages, retry)
+        if result is None:
+            logger.error("[Chat] 生成总结失败，返回 None")
+        return result
     
     async def extract_facts(self, context: str, retry: int = 3) -> List[str]:
         """提取重要事实"""
@@ -159,6 +163,9 @@ class ChatClient:
         }]
         
         result = await self.generate_response(messages, retry)
+        if result is None:
+            logger.error("[Chat] 提取事实失败，返回空列表")
+            return []
         if result.strip() == "无":
             logger.info("[Chat] 未提取到任何事实")
             return []
@@ -239,7 +246,11 @@ class ChatClient:
             return response.choices[0].message.content or "{}"
         except Exception:
             # 回退到普通模式
-            return await self.generate_response(messages, retry)
+            fallback = await self.generate_response(messages, retry)
+            if not fallback:
+                logger.error("[Chat] 生成每日总结数据失败，返回空 JSON")
+                return "{}"
+            return fallback
 
 class EmbeddingClient:
     """Embedding 模型客户端 - 专注文本向量化"""

@@ -178,6 +178,9 @@ class DailySummaryGenerator:
                         from openai.types.chat import ChatCompletionMessageParam
                         messages = [{"role": "user", "content": fix_prompt}]
                         json_str = await self.chat_client.generate_response(messages, retry=1)
+                        if not json_str:
+                            logger.error("请求 AI 修复 JSON 失败，未返回内容")
+                            return None
                         logger.debug(f"AI 修复后的 JSON: {json_str}")
                     except Exception as fix_e:
                         logger.error(f"请求 AI 修复 JSON 失败: {fix_e}")

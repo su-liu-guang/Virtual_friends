@@ -7,16 +7,22 @@ from nonebot.exception import MatcherException, FinishedException
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import random
 import re
 from pathlib import Path
 
 from .config import ConfigManager
-from .database import init_db, Message, Summary, ImportantEvent
+from .database import init_db, Message, Summary, ImportantEvent, MemoryVector
 from .clients import VisionClient, ChatClient, EmbeddingClient
-from .logic import ContextBuilder, process_image_message
+from .logic import (
+    ContextBuilder,
+    process_image_message,
+    sanitize_persona_reply,
+    has_complete_persona_reply_tag,
+    PERSONA_REPLY_RETRY_PROMPT,
+)
 from .scheduler import MemoryScheduler
 from .active_behavior import ActiveBehaviorManager
 from .summary import DailySummaryGenerator
@@ -232,11 +238,25 @@ async def handle_message(bot: Bot, event: MessageEvent):
         current_time=timestamp
     )
     logger.debug(format_context_for_debug(context))
-    response = await chat_client.generate_response(context)
-    response = response.strip()  # 去除首尾空格和换行
-    
-    # 去除可能的时间戳前缀 [2025-12-12 19:30]
-    response = re.sub(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*", "", response)
+    response_raw = await chat_client.generate_response(context)
+    if not response_raw:
+        logger.error("[Chat] 生成回复失败，已跳过存储与发送")
+        return
+
+    if not has_complete_persona_reply_tag(response_raw):
+        logger.warning("[Chat] 首次回复标签不完整，尝试一次格式修复重试")
+        repair_context = [
+            *context,
+            {"role": "user", "content": PERSONA_REPLY_RETRY_PROMPT},
+        ]
+        repaired = await chat_client.generate_response(repair_context, retry=1)
+        if repaired:
+            response_raw = repaired
+
+    response = sanitize_persona_reply(response_raw)
+    if not response:
+        logger.error("[Chat] 生成回复为空，已跳过存储与发送")
+        return
     
     # 存储并发送回复
     reply_timestamp = get_current_time()
@@ -301,6 +321,7 @@ update_config = on_command("修改配置", aliases={"vf设置", "更新配置"},
 reload_config = on_command("重载配置", aliases={"刷新配置", "重载人设", "刷新人设"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
 daily_summary_cmd = on_command("今日总结", aliases={"群聊日报"}, priority=5, block=True)
 test_summary_cmd = on_command("测试日报", aliases={"历史日报"}, priority=5, block=True, permission=SUPERUSER)
+yesterday_summary_cmd = on_command("昨日总结", aliases={"昨天总结", "昨日日报"}, priority=5, block=True)
 help_cmd = on_command("vf帮助", aliases={"vf菜单", "vf指令列表"}, priority=5, block=True)
 backfill_vectors_cmd = on_command("回填记忆向量", priority=5, block=True, permission=SUPERUSER)
 
@@ -365,6 +386,7 @@ async def handle_clear_memory(bot: Bot, event: MessageEvent):
         await Message.filter(group_id=group_id).delete()
         await Summary.filter(group_id=group_id).delete()
         await ImportantEvent.filter(group_id=group_id).delete()
+        await MemoryVector.filter(group_id=group_id).delete()
         await clear_memory.finish("✅ 已清空当前群组的所有记忆")
     except MatcherException:
         raise
@@ -375,9 +397,13 @@ async def handle_clear_memory(bot: Bot, event: MessageEvent):
 
 @persona_list.handle()
 async def handle_persona_list(bot: Bot, event: MessageEvent):
+    group_id = get_group_id(event)
     personas = config_manager.get_personas()
+    current_persona = config_manager.get_instance_config(group_id).get("persona_name")
     msg = "\n".join([f"• {k}" for k in personas.keys()])
-    await persona_list.finish(f"📝 可用人设:\n{msg}\n使用 /切换人设 [名称] 切换")
+    await persona_list.finish(
+        f"🪪 当前人设: {current_persona}\n\n📝 可用人设:\n{msg}\n\n使用 /切换人设 [名称] 切换"
+    )
 
 @view_persona.handle()
 async def handle_view_persona(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
@@ -569,6 +595,25 @@ async def handle_daily_summary(bot: Bot, event: MessageEvent):
         logger.error(f"生成日报出错: {e}")
         await daily_summary_cmd.finish(f"生成日报出错: {e}")
 
+@yesterday_summary_cmd.handle()
+async def handle_yesterday_summary(bot: Bot, event: MessageEvent):
+    group_id = get_group_id(event)
+    target_date = datetime.now().astimezone() - timedelta(days=1)
+    await yesterday_summary_cmd.send("正在生成昨日群聊日报，请稍候...")
+
+    try:
+        from nonebot.adapters.onebot.v11 import MessageSegment
+        img = await daily_summary_generator.generate_report(group_id, target_date=target_date)
+        if img:
+            await yesterday_summary_cmd.finish(MessageSegment.image(img))
+        else:
+            await yesterday_summary_cmd.finish("生成昨日日报失败，可能是昨日无消息或缺少依赖。")
+    except FinishedException:
+        raise
+    except Exception as e:
+        logger.error(f"生成昨日日报出错: {e}")
+        await yesterday_summary_cmd.finish(f"生成昨日日报出错: {e}")
+
 @test_summary_cmd.handle()
 async def handle_test_summary(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
     arg_text = args.extract_plain_text().strip()
@@ -613,6 +658,7 @@ async def handle_help(bot: Bot, event: MessageEvent):
 • /查看提示词 [名称] - 查看指定人设详情
 • /记忆状态 - 查看当前群聊的记忆统计
 • /今日总结 - 生成今日群聊日报
+• /昨日总结 - 生成昨日群聊日报
 
 管理指令 (超管/群主/管理员):
 • /提示词列表 - 查看所有可用人设

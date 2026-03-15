@@ -1,13 +1,103 @@
 import hashlib
 import aiohttp
+import re
 from datetime import datetime
 from typing import List, Optional
 from nonebot import logger
 from openai.types.chat import ChatCompletionMessageParam
-from .database import Message, ImageCache
+from .database import Message, ImageCache, Summary
 from .config import ConfigManager
 
 ERROR_CAPTION_PREFIXES = ("[图片识别失败", "[Vision Error")
+
+OUTPUT_FORMAT_TAIL_PROMPT = """
+[输出格式要求]
+你只输出人设正在说的话，不要输出任何额外说明、角色分析、旁白、动作描写或思考过程。
+你必须且只能输出一个完整标签块，严格使用以下格式：
+<persona_reply>你的回复内容</persona_reply>
+
+[硬性规则]
+1. 必须同时包含开始标签 <persona_reply> 和结束标签 </persona_reply>。
+2. 禁止输出第二个 persona_reply 标签块。
+3. 禁止输出 markdown 代码块、解释文字、前后缀说明。
+4. 在输出前先自检：若标签不闭合，必须先补全，再输出。
+
+[兜底模板]
+如果你不确定如何回答，也必须输出：
+<persona_reply>...</persona_reply>
+""".strip()
+
+PERSONA_REPLY_RETRY_PROMPT = (
+    "你上次输出的 <persona_reply> 标签格式不完整或不合规。"
+    "现在只允许返回一个完整标签块，且必须闭合："
+    "<persona_reply>你的回复内容</persona_reply>。"
+    "禁止返回任何额外文字、解释、代码块或多标签。"
+)
+
+
+def has_complete_persona_reply_tag(raw_text: Optional[str]) -> bool:
+    """检查是否包含完整的 persona_reply 标签对。"""
+    if not raw_text:
+        return False
+    text = raw_text.strip()
+    if not text:
+        return False
+    return re.search(r"<persona_reply>\s*.*?\s*</persona_reply>", text, flags=re.IGNORECASE | re.DOTALL) is not None
+
+
+def sanitize_persona_reply(raw_text: Optional[str]) -> str:
+    """清洗模型输出，仅保留人设台词内容。"""
+    if not raw_text:
+        return ""
+
+    text = raw_text.strip()
+    if not text:
+        return ""
+
+    # 优先提取强约束标签中的内容
+    tagged = re.search(r"<persona_reply>\s*(.*?)\s*</persona_reply>", text, flags=re.IGNORECASE | re.DOTALL)
+    if tagged:
+        text = tagged.group(1).strip()
+    else:
+        # 半闭合容错: 只有开标签或只有闭标签时，尽量提取正文
+        open_only = re.search(r"<persona_reply>\s*(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
+        close_only = re.search(r"^(.*?)\s*</persona_reply>", text, flags=re.IGNORECASE | re.DOTALL)
+        if open_only:
+            text = open_only.group(1).strip()
+        elif close_only:
+            text = close_only.group(1).strip()
+
+    # 去掉常见 markdown 包裹
+    text = re.sub(r"^```(?:[a-zA-Z]+)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    # 去除可能的时间戳前缀 [2025-12-12 19:30]
+    text = re.sub(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*", "", text)
+
+    # 逐行移除常见元信息和说话人前缀
+    cleaned_lines: List[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        if re.match(r"^\{\{发送图片:.*\}\}$", line):
+            cleaned_lines.append(line)
+            continue
+
+        if re.match(r"^(?:说明|注[:：]|系统|旁白|内心|思考|analysis|assistant|user)\b", line, flags=re.IGNORECASE):
+            continue
+
+        # 例: 小明: 你好 / [小明]: 你好 / （小明）：你好
+        line = re.sub(
+            r"^(?:\[[^\]]{1,20}\]|（[^）]{1,20}）|\([^)]{1,20}\)|[A-Za-z\u4e00-\u9fa5]{1,20})\s*[：:]\s*",
+            "",
+            line,
+        )
+        if line:
+            cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
 
 
 def is_valid_caption(caption: Optional[str]) -> bool:
@@ -65,13 +155,21 @@ class ContextBuilder:
         config = self.config_manager.get_instance_config(group_id)
         persona_prompt = self.config_manager.get_persona_prompt(config["persona_name"])
         
-        # Recent Layer - 最近未总结的消息（is_processed=False）
-        # 提前获取以便用于检索
-        recent_msgs = (
-            await Message.filter(group_id=group_id, is_processed=False)
-            .order_by("timestamp", "id")
-            .limit(100)
+        # Recent Layer - 最近 50 条消息（无论是否已处理）
+        recent_msgs_desc = (
+            await Message.filter(group_id=group_id)
+            .order_by("-timestamp", "-id")
+            .limit(50)
             .all()
+        )
+        # 还原为时间正序，便于模型理解对话流
+        recent_msgs = list(reversed(recent_msgs_desc))
+
+        # L1 Layer - 最近一条 L1 摘要
+        latest_l1_summary = (
+            await Summary.filter(group_id=group_id, level=1, is_archived=False)
+            .order_by("-created_at", "-id")
+            .first()
         )
 
         # Knowledge & Memory Layer
@@ -113,12 +211,22 @@ class ContextBuilder:
 [用户称呼]: {user_nickname}
 {knowledge_text}
 """
+
+        # 默认尾部提示词：约束模型仅输出人设台词，便于后续正则清洗
+        system_content += f"\n\n{OUTPUT_FORMAT_TAIL_PROMPT}"
         
         # Memory Layer - 使用检索结果，减少 token
         if memory_hits:
             system_content += "\n[记忆回顾]:\n"
             for item in memory_hits:
                 system_content += f"- ({item['tag']}) {item['content']}\n"
+
+        if latest_l1_summary and latest_l1_summary.content:
+            system_content += (
+                "\n[最近L1总结]:\n"
+                f"时间范围: {latest_l1_summary.time_range}\n"
+                f"{latest_l1_summary.content.strip()}\n"
+            )
         
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_content.strip()}]
         

@@ -1,6 +1,5 @@
 import random
 import asyncio
-import re
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
@@ -8,7 +7,12 @@ import nonebot
 from nonebot import logger
 
 from .config import ConfigManager
-from .logic import ContextBuilder
+from .logic import (
+	ContextBuilder,
+	sanitize_persona_reply,
+	has_complete_persona_reply_tag,
+	PERSONA_REPLY_RETRY_PROMPT,
+)
 from .clients import ChatClient
 from .database import Message
 from .scheduler import MemoryScheduler
@@ -86,13 +90,13 @@ class ActiveBehaviorManager:
 		if not self._within_active_hours(config.get("active_hours"), now.hour):
 			return
 
-		# 软性过滤层
-		last_message = await Message.filter(group_id=group_id).order_by("-timestamp").first()
+		# 软性过滤层：仅看机器人自身的上次发言冷却
+		last_bot_msg = await Message.filter(group_id=group_id, role="ai").order_by("-timestamp").first()
 		group_cooldown = self._safe_int(config.get("cooldown_hours"), default=self.cooldown_hours)
-		hours_since_last_msg = self._hours_since(last_message.timestamp, now) if last_message else float("inf")
-		if hours_since_last_msg < group_cooldown:
+		hours_since_bot_msg = self._hours_since(last_bot_msg.timestamp, now) if last_bot_msg else float("inf")
+		if hours_since_bot_msg < group_cooldown:
 			logger.debug(
-				f"[Active] 群 {group_id} 距离上次互动仅 {hours_since_last_msg:.2f}h, 仍在冷却中(冷却阈值: {group_cooldown}h)"
+				f"[Active] 群 {group_id} 距离上次机器人发言仅 {hours_since_bot_msg:.2f}h, 仍在冷却中(冷却阈值: {group_cooldown}h)"
 			)
 			return
 
@@ -132,10 +136,22 @@ class ActiveBehaviorManager:
 		prompt = self._build_prompt(is_revival_mode, hours_since_user)
 		context.append({"role": "user", "content": prompt})
 
-		reply = (await self.chat_client.generate_response(context)).strip()
-		
-		# 去除可能的时间戳前缀 [2025-12-12 19:30]
-		reply = re.sub(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\]\s*", "", reply)
+		reply_raw = await self.chat_client.generate_response(context)
+		if not reply_raw:
+			logger.warning(f"[Active] 群 {group_id} 主动消息生成失败，已忽略")
+			return
+
+		if not has_complete_persona_reply_tag(reply_raw):
+			logger.warning(f"[Active] 群 {group_id} 首次输出标签不完整，尝试一次格式修复重试")
+			repair_context = [
+				*context,
+				{"role": "user", "content": PERSONA_REPLY_RETRY_PROMPT},
+			]
+			repaired = await self.chat_client.generate_response(repair_context, retry=1)
+			if repaired:
+				reply_raw = repaired
+
+		reply = sanitize_persona_reply(reply_raw)
 		
 		if not reply:
 			logger.warning(f"[Active] 群 {group_id} 生成的主动消息为空, 已忽略")

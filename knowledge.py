@@ -204,7 +204,7 @@ class KnowledgeBase:
         self.index_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-    async def search(self, query: str, top_k: int = 3, min_score: float = 0.28) -> List[Dict]:
+    async def search(self, query: str, top_k: int = 3, min_score: float = 0.2) -> List[Dict]:
         """搜索相关片段，低于阈值则视为不相关，避免乱插参考资料；可选 rerank 优化排序"""
         if not self.chunks:
             return []

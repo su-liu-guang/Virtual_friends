@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime
 from typing import List
+from nonebot import logger
 from openai.types.chat import ChatCompletionMessageParam
 from .database import Message, Summary, ImportantEvent
 
@@ -59,21 +60,27 @@ class MemoryScheduler:
         
         context = "\n".join(context_lines)
         
-        # 并行任务 A: 生成摘要
+        # 并行任务 A/B
         summary_task = self._generate_summary(group_id, context, messages)
-        
-        # 并行任务 B: 提取事实
         facts_task = self._extract_facts(group_id, context)
-        
-        await asyncio.gather(summary_task, facts_task)
-        
-        # 标记为已处理
-        message_ids = [msg.id for msg in messages]
-        await Message.filter(id__in=message_ids).update(is_processed=True)
+
+        summary_ok, facts_ok = await asyncio.gather(summary_task, facts_task)
+
+        # 仅当摘要与事实均成功时才标记已处理，避免数据丢失
+        if summary_ok and facts_ok:
+            message_ids = [msg.id for msg in messages]
+            await Message.filter(id__in=message_ids).update(is_processed=True)
+        else:
+            logger.warning(
+                f"[Scheduler] 本批处理未完成 (summary_ok={summary_ok}, facts_ok={facts_ok})，保持未处理状态以便重试"
+            )
     
-    async def _generate_summary(self, group_id: str, context: str, messages: List):
-        """生成 L1 摘要"""
+    async def _generate_summary(self, group_id: str, context: str, messages: List) -> bool:
+        """生成 L1 摘要，成功返回 True"""
         summary_text = await self.chat_client.generate_summary(context)
+        if not summary_text:
+            logger.error(f"[Scheduler] 生成摘要失败，已跳过写入 (group={group_id})")
+            return False
         
         start_time = messages[0].timestamp.astimezone()
         end_time = messages[-1].timestamp.astimezone()
@@ -88,9 +95,11 @@ class MemoryScheduler:
 
         if self.memory_retriever:
             asyncio.create_task(self.memory_retriever.upsert_summary(summary))
+
+        return True
     
-    async def _extract_facts(self, group_id: str, context: str):
-        """提取并存储重要事实"""
+    async def _extract_facts(self, group_id: str, context: str) -> bool:
+        """提取并存储重要事实，成功返回 True"""
         facts = await self.chat_client.extract_facts(context)
         
         for fact in facts:
@@ -102,6 +111,8 @@ class MemoryScheduler:
 
             if self.memory_retriever:
                 asyncio.create_task(self.memory_retriever.upsert_fact(event))
+
+        return True
     
     async def _check_archive(self, group_id: str):
         """检查并执行归档"""
@@ -142,6 +153,9 @@ class MemoryScheduler:
         
         messages: List[ChatCompletionMessageParam] = [{"role": "user", "content": prompt}]
         merged_summary = await self.chat_client.generate_response(messages)
+        if not merged_summary:
+            logger.error(f"[Scheduler] 合并摘要失败，已跳过写入 (group={group_id})")
+            return
         
         # 创建新层级摘要
         start_time = summaries[0].time_range.split("-")[0]
