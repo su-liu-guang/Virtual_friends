@@ -2,34 +2,60 @@ import hashlib
 import aiohttp
 import re
 from datetime import datetime
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Tuple
 from nonebot import logger
 from openai.types.chat import ChatCompletionMessageParam
-from .database import Message, ImageCache, Summary, ImportantEvent
+from .database import Message, ImageCache, Summary
 from .config import ConfigManager
 
 ERROR_CAPTION_PREFIXES = ("[图片识别失败", "[Vision Error")
 
 # ====== 格式约束提示词 — 放在 system 最开头 ======
-OUTPUT_FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
-你必须且只能输出以下格式：
+OUTPUT_FORMAT_PROMPT = """[输出格式硬性约束 - 必须严格遵守]
+
+你的完整回复必须精确等于以下格式，一个多余字符都不允许：
+
 <persona_reply>你的回复内容</persona_reply>
 
-[硬性规则]
-1. 必须且只能输出一组完整的 <persona_reply> 和 </persona_reply>
-2. 标签外绝对不能有任何文字、说明、旁白、Markdown 标记
-3. 你的回复必须严格以 <persona_reply> 开头，以 </persona_reply> 结尾
-4. 禁止输出多组标签块
+规则：
+1. 回复的第一个字符必须是 <persona_reply> 的 <
+2. 回复的最后一个字符必须是 </persona_reply> 的 >
+3. 标签外不允许存在任何内容：无换行、无空格、无解释文字、无 Markdown
+4. 禁止在标签前添加时间戳、昵称、思考过程、旁白、引导语
 
-正确示例：<persona_reply>早上好呀，今天天气真不错呢！</persona_reply>
+错误示例（这些都是被禁止的）：
+  [2025-01-01 12:00] <persona_reply>你好</persona_reply>
+  <persona_reply>你好</persona_reply>（希望你喜欢）
+  ````<persona_reply>你好</persona_reply>````
+  好的，我来回复：<persona_reply>你好</persona_reply>
+
+正确示例（这是唯一允许的格式）：
+<persona_reply>你好呀，今天天气真好！</persona_reply>
 """.strip()
+
+# ====== 放在 system prompt 末尾的格式再次提醒（利用近因效应）======
+FORMAT_REMINDER = "\n\n[再次强调] 你的回复必须等于 <persona_reply>回复内容</persona_reply>，标签外零字符。"
 
 # ====== 格式修正重试 system prompt — 放在 retry context 最开头 ======
 FORMAT_RETRY_SYSTEM = """[格式修正 - 最高优先级]
-你之前的回复格式不正确。现在你必须且只能输出一组完整的标签：
+你上一次的回复格式不正确。请重新回复，严格输出：
 <persona_reply>你的回复内容</persona_reply>
-禁止任何标签外的文字、解释或 Markdown 符号。
-""".strip()
+零额外字符，零标签外内容。""".strip()
+
+def _build_user_message_instructions() -> str:
+    """构建追加到首个 user 消息末尾的纯格式+沉浸指令。
+    
+    这些指令是纯静态文本，不影响 LLM 缓存命中率。
+    动态上下文（时间/用户/knowledge/L1摘要）已移到当前 user 消息前缀中。
+    """
+    return """
+
+[输出格式要求] 你的回复必须严格以 <persona_reply> 开头、以 </persona_reply> 结尾，标签外零字符。
+
+【角色沉浸要求】在你的思考过程（<think>标签内）中，请遵守以下规则：
+1. 请以角色第一人称进行内心独白，用括号包裹内心活动，例如"（心想：……）"或"(内心OS：……)"
+2. 用第一人称描写角色的内心感受，例如"我心想""我觉得""我暗自"等
+3. 思考内容应沉浸在角色中，通过内心独白分析剧情和规划回复"""
 
 
 def has_complete_persona_reply_tag(raw_text: Optional[str]) -> bool:
@@ -136,31 +162,42 @@ async def generate_with_format_retry(
     validator: Callable[[str], bool],
     retry_prompt_system: str,
     max_retries: int = 1,
-) -> Optional[str]:
+) -> Tuple[Optional[str], Optional[str]]:
     """
     通用格式校验 + 重试函数。
-    
-    发送消息 → 校验格式 → 失败则将格式提示词作为 system 第一条重试。
-    retry 时 FORMAT_PROMPT 放在 context 最前面（system），原有消息保留在后。
+
+    发送消息 → 校验格式 → 失败则将格式提示词合并到已有 system 消息中重试。
+    返回 (raw_content, reasoning_content) 元组。
     """
-    raw = await chat_client.generate_chat_reply(messages, retry=3)
-    if not raw:
-        return None
+    result = await chat_client.generate_chat_reply(messages, retry=3)
+    if not result:
+        return (None, None)
+
+    raw, reasoning = result
 
     if validator(raw):
-        return raw
+        return (raw, reasoning)
 
-    # 格式校验失败，构造修正型重试
+    # 格式校验失败，将修正指令合并到已有 system 消息中重试
     logger.warning("[Format] 首次输出格式不完整，构造修正重试")
-    retry_messages: List[ChatCompletionMessageParam] = [
-        {"role": "system", "content": retry_prompt_system},
-        *messages,
-    ]
-    repaired = await chat_client.generate_chat_reply(retry_messages, retry=1)
-    if repaired and validator(repaired):
-        return repaired
+    retry_messages: List[ChatCompletionMessageParam] = []
+    system_found = False
+    for msg in messages:
+        if msg["role"] == "system" and not system_found:
+            system_found = True
+            retry_messages.append({
+                "role": "system",
+                "content": retry_prompt_system + "\n\n---\n\n" + msg["content"]  # type: ignore[dict-item]
+            })
+        else:
+            retry_messages.append(msg)
+    repaired_result = await chat_client.generate_chat_reply(retry_messages, retry=1)
+    if repaired_result:
+        repaired_raw, repaired_reasoning = repaired_result
+        if validator(repaired_raw):
+            return (repaired_raw, repaired_reasoning)
 
-    return raw  # 回退，交给 sanitize 清洗
+    return (raw, reasoning)  # 回退，交给 sanitize 清洗
 
 
 class ContextBuilder:
@@ -189,27 +226,25 @@ class ContextBuilder:
         )
         recent_msgs = list(reversed(recent_msgs_desc))
 
-        # ---- L1/L2/L3 全量摘要 ----
+        # ---- L1/L2/L3 摘要（加 limit 截断） ----
         all_l1 = (
             await Summary.filter(group_id=group_id, level=1, is_archived=False)
             .order_by("-created_at")
+            .limit(15)
             .all()
         )
         all_l2 = (
             await Summary.filter(group_id=group_id, level=2, is_archived=False)
             .order_by("-created_at")
+            .limit(10)
             .all()
         )
         all_l3 = (
             await Summary.filter(group_id=group_id, level=3, is_archived=False)
             .order_by("-created_at")
+            .limit(5)
             .all()
         )
-
-        # ---- ImportantEvent 直连查询 ----
-        all_facts = await ImportantEvent.filter(
-            group_id=group_id, validity=True
-        ).order_by("-recorded_date").all()
 
         # ---- Knowledge Layer ----
         knowledge_text = ""
@@ -234,45 +269,24 @@ class ContextBuilder:
         weekday = weekday_cn[current_time.isoweekday() - 1]
         time_str = f"{current_time.strftime('%Y年%m月%d日')} 星期{weekday} {current_time.strftime('%H:%M')}"
         
-        # ====== System Content — 格式要求放在最前面 ======
-        system_content = OUTPUT_FORMAT_PROMPT  # 第一行就是格式约束
-        
+        # ====== SYSTEM MESSAGE: 静态 + 准静态（最大化 LLM 缓存命中）======
+        system_content = OUTPUT_FORMAT_PROMPT
         system_content += f"\n\n{persona_prompt}"
-        system_content += f"\n\n[当前时间]: {time_str}"
-        system_content += f"\n[用户称呼]: {user_nickname}"
-        system_content += f"\n{knowledge_text}"
 
-        # ---- 全量摘要注入 ----
+        # L3 宏观印象 — 数月不变，准静态
         if all_l3:
             system_content += "\n\n[宏观印象 L3]:\n"
             for s3 in all_l3:
                 system_content += f"- ({s3.time_range}) {s3.content.strip()}\n"
 
+        # L2 叙事概括 — 数天不变，相对稳定
         if all_l2:
             system_content += "\n\n[叙事概括 L2]:\n"
             for s2 in all_l2:
                 system_content += f"- ({s2.time_range}) {s2.content.strip()}\n"
 
-        if all_l1:
-            system_content += "\n\n[近期详情 L1]:\n"
-            for s1 in all_l1:
-                system_content += f"- ({s1.time_range}) {s1.content.strip()}\n"
+        system_content += FORMAT_REMINDER
 
-        # ---- 事实注入（近期 vs 远期分层）----
-        if all_facts:
-            now_date = current_time.date()
-            recent_facts = [f for f in all_facts if (now_date - f.recorded_date).days <= 14]
-            old_facts = [f for f in all_facts if (now_date - f.recorded_date).days > 14]
-            if recent_facts:
-                system_content += "\n\n[近期重要事实]:\n"
-                for f in recent_facts:
-                    prefix = "[高] " if f.confidence == "high" else ""
-                    system_content += f"- {prefix}{f.event_content}\n"
-            if old_facts:
-                system_content += "\n\n[更早的事实]:\n"
-                for f in old_facts[:10]:
-                    system_content += f"- {f.event_content}\n"
-        
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_content.strip()}]
         
         # ---- Recent Layer ----
@@ -297,6 +311,39 @@ class ContextBuilder:
                 "role": role,  # type: ignore
                 "content": content
             }
+            if msg.role == "ai" and msg.reasoning_content:
+                message["reasoning_content"] = msg.reasoning_content  # type: ignore[index]
             messages.append(message)
+
+        # ====== 动态上下文前缀：L1 + 参考资料 注入到第一条 user 消息 ======
+        context_parts: List[str] = []
+
+        if all_l1:
+            lines = ["[近期详情 L1]:"]
+            for s1 in all_l1:
+                lines.append(f"- ({s1.time_range}) {s1.content.strip()}")
+            context_parts.append("\n".join(lines))
+
+        if knowledge_text.strip():
+            context_parts.append(knowledge_text.strip())
+
+        context_prefix = "\n\n".join(context_parts) + "\n\n---\n\n" if context_parts else ""
+
+        format_instructions = _build_user_message_instructions()
+        for m in messages:
+            if m["role"] == "user":
+                cur = m.get("content", "")
+                if isinstance(cur, str):
+                    m["content"] = context_prefix + cur + format_instructions  # type: ignore[index]
+                break
+
+        # ====== 时间前缀：注入到最后一条 user 消息（紧邻当前问题）======
+        time_prefix = f"[当前时间]: {time_str}\n[当前对话对象]: {user_nickname}\n\n"
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i]["role"] == "user":
+                cur = messages[i].get("content", "")
+                if isinstance(cur, str):
+                    messages[i]["content"] = time_prefix + cur  # type: ignore[index]
+                break
 
         return messages

@@ -22,6 +22,7 @@ class Message(Model):
     display_time = fields.CharField(max_length=30, null=True, description="人类可读的时间格式 YYYY-MM-DD HH:MM")
     weekday = fields.CharField(max_length=10, null=True)
     is_processed = fields.BooleanField(default=False, index=True)
+    reasoning_content = fields.TextField(null=True, description="DeepSeek 思考模式的思维链内容")
     
     class Meta: # type: ignore
         table = "messages"
@@ -38,19 +39,6 @@ class Summary(Model):
     
     class Meta: # type: ignore
         table = "summaries"
-
-class ImportantEvent(Model):
-    id = fields.IntField(pk=True)
-    group_id = fields.CharField(max_length=50, index=True)
-    event_content = fields.TextField()
-    fact_type = fields.CharField(max_length=20, null=True, index=True)  # plan / attribute / commitment / merged
-    confidence = fields.CharField(max_length=10, null=True)  # high / medium
-    recorded_date = fields.DateField(auto_now_add=True)
-    expires_at = fields.DateField(null=True)  # plan/commitment 过期日
-    validity = fields.BooleanField(default=True, index=True)
-    
-    class Meta: # type: ignore
-        table = "important_events"
 
 async def init_db():
     """初始化数据库"""

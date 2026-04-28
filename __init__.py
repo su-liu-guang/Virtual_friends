@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 from .config import ConfigManager
-from .database import init_db, Message, Summary, ImportantEvent
+from .database import init_db, Message, Summary
 from .clients import VisionClient, ChatClient, EmbeddingClient
 from .logic import (
     ContextBuilder,
@@ -237,7 +237,7 @@ async def handle_message(bot: Bot, event: MessageEvent):
         current_time=timestamp
     )
     logger.debug(format_context_for_debug(context))
-    response_raw = await generate_with_format_retry(
+    response_raw, reasoning = await generate_with_format_retry(
         chat_client,
         context,
         validator=has_complete_persona_reply_tag,
@@ -263,7 +263,8 @@ async def handle_message(bot: Bot, event: MessageEvent):
         timestamp=reply_timestamp,
         display_time=reply_display_time,
         weekday=get_weekday_label(reply_timestamp),
-        is_processed=False
+        is_processed=False,
+        reasoning_content=reasoning,
     )
     
     # 处理图片发送指令
@@ -299,7 +300,6 @@ async def handle_message(bot: Bot, event: MessageEvent):
 
 switch_persona = on_command("切换人设", aliases={"切换提示词"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
 memory_status = on_command("记忆状态", aliases={"查看记忆"}, priority=5, block=True)
-forget_cmd = on_command("遗忘", priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
 clear_memory = on_command("清空记忆", aliases={"重置记忆"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
 persona_list = on_command("提示词列表", aliases={"人设列表"}, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN, priority=5, block=True)
 view_persona = on_command("查看提示词", aliases={"查看人设"}, priority=5, block=True)
@@ -342,7 +342,6 @@ async def handle_memory_status(bot: Bot, event: MessageEvent):
     l1 = await Summary.filter(group_id=group_id, level=1, is_archived=False).count()
     l2 = await Summary.filter(group_id=group_id, level=2, is_archived=False).count()
     l3 = await Summary.filter(group_id=group_id, level=3, is_archived=False).count()
-    facts = await ImportantEvent.filter(group_id=group_id, validity=True).count()
     pending = await Message.filter(group_id=group_id, is_processed=False).count()
     
     await memory_status.finish(f"""📊 记忆系统状态
@@ -352,23 +351,8 @@ async def handle_memory_status(bot: Bot, event: MessageEvent):
   L2 叙事概括: {l2} 条
   L3 宏观印象: {l3} 条
 
-⭐ 锚点事实: {facts } 条
 ⏳ 待处理消息: {pending} 条
 ━━━━━━━━━━━━━━""")
-
-@forget_cmd.handle()
-async def handle_forget(bot: Bot, event: MessageEvent, args: OB11Message = CommandArg()):
-    keyword = args.extract_plain_text().strip()
-    if not keyword:
-        await forget_cmd.finish("用法: /遗忘 [关键词]")
-    
-    group_id = get_group_id(event)
-    deleted_count = await ImportantEvent.filter(group_id=group_id, event_content__contains=keyword).delete()
-    
-    if deleted_count:
-        await forget_cmd.finish(f"已删除 {deleted_count} 条包含 '{keyword}' 的记忆")
-    else:
-        await forget_cmd.finish(f"未找到包含 '{keyword}' 的记忆")
 
 @clear_memory.handle()
 async def handle_clear_memory(bot: Bot, event: MessageEvent):
@@ -376,7 +360,6 @@ async def handle_clear_memory(bot: Bot, event: MessageEvent):
     try:
         await Message.filter(group_id=group_id).delete()
         await Summary.filter(group_id=group_id).delete()
-        await ImportantEvent.filter(group_id=group_id).delete()
         await clear_memory.finish("✅ 已清空当前群组的所有记忆")
     except MatcherException:
         raise
@@ -657,7 +640,6 @@ async def handle_help(bot: Bot, event: MessageEvent):
 • /人生启动 - 在当前群启用插件
 • /世界终结 - 在当前群禁用插件
 • /清空记忆 - 删除当前群的所有记忆数据
-• /遗忘 [关键词] - 删除包含关键词的特定记忆
 • /查看配置 - 查看当前群组的详细配置
 • /修改配置 <JSON> - 修改当前群组配置
 • /重载配置 - 重新加载配置文件
@@ -696,18 +678,6 @@ async def check_daily_summary():
                 logger.error(f"发送群 {group_id} 每日总结失败: {e}")
 
 
-async def daily_fact_maintenance():
-    """每天凌晨 3 点对所有已启用群组做事实库深度维护"""
-    logger.info("[Fact Maintenance] 开始每日深度维护")
-    for group_id in config_manager.get_all_group_ids():
-        if not config_manager.is_in_whitelist(group_id):
-            continue
-        try:
-            memory_scheduler.last_fact_maintenance[group_id] = datetime.now()
-            await memory_scheduler._maintain_facts(group_id)
-        except Exception as e:
-            logger.error(f"[Fact Maintenance] 群 {group_id} 维护失败: {e}")
-
 @driver.on_startup
 async def startup():
     await init_db()
@@ -731,15 +701,7 @@ async def startup():
                 id="virtual_friends_daily_summary",
                 replace_existing=True
             )
-            scheduler.add_job(
-                daily_fact_maintenance,
-                "cron",
-                hour=3,
-                minute=0,
-                id="virtual_friends_fact_maintenance",
-                replace_existing=True,
-            )
-            logger.success("定时任务已启动（主动行为 + 日报 + 事实维护）")
+            logger.success("定时任务已启动（主动行为 + 日报）")
         except Exception as e:
             logger.error(f"启动定时任务失败: {e}")
 

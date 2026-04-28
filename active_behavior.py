@@ -137,7 +137,7 @@ class ActiveBehaviorManager:
 		prompt = self._build_prompt(is_revival_mode, hours_since_user)
 		context.append({"role": "user", "content": prompt})
 
-		reply_raw = await generate_with_format_retry(
+		reply_raw, reasoning = await generate_with_format_retry(
 			self.chat_client,
 			context,
 			validator=has_complete_persona_reply_tag,
@@ -168,6 +168,7 @@ class ActiveBehaviorManager:
 				display_time=display_time,
 				weekday=weekday_label(stored_time),
 				is_processed=False,
+				reasoning_content=reasoning,
 			)
 			logger.success(
 				f"[Active] 已向群 {group_id} 发送{'唤醒' if is_revival_mode else '闲聊'}消息: {reply[:30]}..."
