@@ -14,20 +14,20 @@ import re
 from pathlib import Path
 
 from .config import ConfigManager
-from .database import init_db, Message, Summary, ImportantEvent, MemoryVector
+from .database import init_db, Message, Summary, ImportantEvent
 from .clients import VisionClient, ChatClient, EmbeddingClient
 from .logic import (
     ContextBuilder,
     process_image_message,
     sanitize_persona_reply,
     has_complete_persona_reply_tag,
-    PERSONA_REPLY_RETRY_PROMPT,
+    FORMAT_RETRY_SYSTEM,
+    generate_with_format_retry,
 )
 from .scheduler import MemoryScheduler
 from .active_behavior import ActiveBehaviorManager
 from .summary import DailySummaryGenerator
 from .knowledge import KnowledgeBase
-from .memory_retriever import MemoryRetriever
 
 __plugin_meta__ = PluginMetadata(
     name="Virtual Friends",
@@ -43,9 +43,8 @@ vision_client = VisionClient()
 chat_client = ChatClient()
 embedding_client = EmbeddingClient()
 knowledge_base = KnowledgeBase()
-memory_retriever = MemoryRetriever(embedding_client, config_manager)
-context_builder = ContextBuilder(config_manager, knowledge_base, memory_retriever)
-memory_scheduler = MemoryScheduler(chat_client, memory_retriever)
+context_builder = ContextBuilder(config_manager, knowledge_base)
+memory_scheduler = MemoryScheduler(chat_client)
 active_behavior_manager = ActiveBehaviorManager(config_manager, chat_client, context_builder, memory_scheduler)
 daily_summary_generator = DailySummaryGenerator(chat_client, config_manager)
 
@@ -238,20 +237,13 @@ async def handle_message(bot: Bot, event: MessageEvent):
         current_time=timestamp
     )
     logger.debug(format_context_for_debug(context))
-    response_raw = await chat_client.generate_response(context)
-    if not response_raw:
-        logger.error("[Chat] 生成回复失败，已跳过存储与发送")
-        return
-
-    if not has_complete_persona_reply_tag(response_raw):
-        logger.warning("[Chat] 首次回复标签不完整，尝试一次格式修复重试")
-        repair_context = [
-            *context,
-            {"role": "user", "content": PERSONA_REPLY_RETRY_PROMPT},
-        ]
-        repaired = await chat_client.generate_response(repair_context, retry=1)
-        if repaired:
-            response_raw = repaired
+    response_raw = await generate_with_format_retry(
+        chat_client,
+        context,
+        validator=has_complete_persona_reply_tag,
+        retry_prompt_system=FORMAT_RETRY_SYSTEM,
+        max_retries=1,
+    )
 
     response = sanitize_persona_reply(response_raw)
     if not response:
@@ -319,11 +311,10 @@ view_whitelist = on_command("查看白名单", priority=5, block=True, permissio
 view_config = on_command("查看配置", aliases={"vf配置", "当前配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
 update_config = on_command("修改配置", aliases={"vf设置", "更新配置"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
 reload_config = on_command("重载配置", aliases={"刷新配置", "重载人设", "刷新人设"}, priority=5, block=True, permission=SUPERUSER | GROUP_OWNER | GROUP_ADMIN)
-daily_summary_cmd = on_command("今日总结", aliases={"群聊日报"}, priority=5, block=True)
+daily_summary_cmd = on_command("今日总结", aliases={"群聊日报"}, priority=5, block=True,permission=SUPERUSER)
 test_summary_cmd = on_command("测试日报", aliases={"历史日报"}, priority=5, block=True, permission=SUPERUSER)
-yesterday_summary_cmd = on_command("昨日总结", aliases={"昨天总结", "昨日日报"}, priority=5, block=True)
+yesterday_summary_cmd = on_command("昨日总结", aliases={"昨天总结", "昨日日报"}, priority=5, block=True, permission=SUPERUSER)
 help_cmd = on_command("vf帮助", aliases={"vf菜单", "vf指令列表"}, priority=5, block=True)
-backfill_vectors_cmd = on_command("回填记忆向量", priority=5, block=True, permission=SUPERUSER)
 
 # ================= 指令处理 =================
 
@@ -386,7 +377,6 @@ async def handle_clear_memory(bot: Bot, event: MessageEvent):
         await Message.filter(group_id=group_id).delete()
         await Summary.filter(group_id=group_id).delete()
         await ImportantEvent.filter(group_id=group_id).delete()
-        await MemoryVector.filter(group_id=group_id).delete()
         await clear_memory.finish("✅ 已清空当前群组的所有记忆")
     except MatcherException:
         raise
@@ -675,42 +665,7 @@ async def handle_help(bot: Bot, event: MessageEvent):
 超管指令:
 • /删除提示词 [名称] - 删除指定人设
 • /查看白名单 - 查看已启用插件的群
-• /测试日报 [日期] - 生成指定日期的日报
-• /回填记忆向量 - 补写历史摘要/事实的向量""")
-
-
-@backfill_vectors_cmd.handle()
-async def handle_backfill_vectors(bot: Bot, event: MessageEvent):
-    if not memory_retriever:
-        await backfill_vectors_cmd.finish("❌ 未启用记忆向量功能")
-
-    await backfill_vectors_cmd.send("⏳ 开始回填历史摘要与事实向量，请稍候...")
-
-    # 回填 Summary
-    summary_count = 0
-    last_id = 0
-    while True:
-        batch = await Summary.filter(id__gt=last_id).order_by("id").limit(100).all()
-        if not batch:
-            break
-        for s in batch:
-            await memory_retriever.upsert_summary(s)
-        summary_count += len(batch)
-        last_id = batch[-1].id
-
-    # 回填 ImportantEvent
-    fact_count = 0
-    last_fact_id = 0
-    while True:
-        batch = await ImportantEvent.filter(id__gt=last_fact_id).order_by("id").limit(100).all()
-        if not batch:
-            break
-        for f in batch:
-            await memory_retriever.upsert_fact(f)
-        fact_count += len(batch)
-        last_fact_id = batch[-1].id
-
-    await backfill_vectors_cmd.finish(f"✅ 回填完成：摘要 {summary_count} 条，事实 {fact_count} 条")
+• /测试日报 [日期] - 生成指定日期的日报""")
 
 
 # ================= 生命周期事件 =================
@@ -740,6 +695,19 @@ async def check_daily_summary():
             except Exception as e:
                 logger.error(f"发送群 {group_id} 每日总结失败: {e}")
 
+
+async def daily_fact_maintenance():
+    """每天凌晨 3 点对所有已启用群组做事实库深度维护"""
+    logger.info("[Fact Maintenance] 开始每日深度维护")
+    for group_id in config_manager.get_all_group_ids():
+        if not config_manager.is_in_whitelist(group_id):
+            continue
+        try:
+            memory_scheduler.last_fact_maintenance[group_id] = datetime.now()
+            await memory_scheduler._maintain_facts(group_id)
+        except Exception as e:
+            logger.error(f"[Fact Maintenance] 群 {group_id} 维护失败: {e}")
+
 @driver.on_startup
 async def startup():
     await init_db()
@@ -763,12 +731,17 @@ async def startup():
                 id="virtual_friends_daily_summary",
                 replace_existing=True
             )
-            logger.success("定时任务已启动")
+            scheduler.add_job(
+                daily_fact_maintenance,
+                "cron",
+                hour=3,
+                minute=0,
+                id="virtual_friends_fact_maintenance",
+                replace_existing=True,
+            )
+            logger.success("定时任务已启动（主动行为 + 日报 + 事实维护）")
         except Exception as e:
             logger.error(f"启动定时任务失败: {e}")
-            logger.info("主动行为调度已启动, 基础心跳 1 分钟")
-        except Exception as exc:
-            logger.error(f"主动行为调度启动失败: {exc}")
 
 @driver.on_shutdown
 async def shutdown():

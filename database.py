@@ -43,30 +43,14 @@ class ImportantEvent(Model):
     id = fields.IntField(pk=True)
     group_id = fields.CharField(max_length=50, index=True)
     event_content = fields.TextField()
+    fact_type = fields.CharField(max_length=20, null=True, index=True)  # plan / attribute / commitment / merged
+    confidence = fields.CharField(max_length=10, null=True)  # high / medium
     recorded_date = fields.DateField(auto_now_add=True)
-    validity = fields.BooleanField(default=True)
+    expires_at = fields.DateField(null=True)  # plan/commitment 过期日
+    validity = fields.BooleanField(default=True, index=True)
     
     class Meta: # type: ignore
         table = "important_events"
-
-
-class MemoryVector(Model):
-    """存储摘要/事实的向量，用于记忆检索"""
-
-    id = fields.IntField(pk=True)
-    group_id = fields.CharField(max_length=50, index=True)
-    ref_type = fields.CharField(max_length=20, index=True)  # summary / fact
-    ref_id = fields.IntField(index=True)
-    level = fields.IntField(null=True, index=True)  # 1/2/3 for summary, None for fact
-    content = fields.TextField()
-    content_hash = fields.CharField(max_length=32, index=True)
-    embedding = fields.JSONField()  # 存储向量
-    created_at = fields.DatetimeField(auto_now_add=True)
-    updated_at = fields.DatetimeField(auto_now=True)
-
-    class Meta: # type: ignore
-        table = "memory_vectors"
-        indexes = (("group_id", "ref_type", "ref_id"),)
 
 async def init_db():
     """初始化数据库"""

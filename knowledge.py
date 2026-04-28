@@ -3,12 +3,63 @@ import re
 import math
 import asyncio
 import hashlib
+import aiohttp
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Set
 from nonebot import logger
 from .clients import EmbeddingClient
 from .config import ConfigManager
-from .memory_retriever import RerankerClient
+
+
+class RerankerClient:
+    """调用 BAAI/bge-reranker-v2-m3 的通用 HTTP 客户端（网络 API）。"""
+
+    def __init__(self, config: ConfigManager):
+        self.api_url = config.get_env("reranker_api_url")
+        self.api_key = config.get_env("reranker_api_key")
+        self.model = config.get_env("reranker_model")
+        self.timeout = int(config.get_env("reranker_timeout", "5") or 5)
+        self.enabled = bool(self.api_url and self.api_key and self.model)
+
+    async def rerank(self, query: str, texts: List[str]) -> Optional[List[float]]:
+        if not self.enabled or not texts:
+            return None
+
+        payload = {
+            "model": self.model,
+            "query": query,
+            "documents": texts,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.api_url, data=json.dumps(payload), headers=headers, timeout=self.timeout) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"[Reranker] HTTP {resp.status}: {await resp.text()}")
+                        return None
+                    data = await resp.json()
+                    if isinstance(data, dict):
+                        if "results" in data and isinstance(data["results"], list):
+                            scores = []
+                            for item in data["results"]:
+                                if isinstance(item, dict):
+                                    if "relevance_score" in item:
+                                        scores.append(float(item["relevance_score"]))
+                                    elif "score" in item:
+                                        scores.append(float(item["score"]))
+                            if scores:
+                                return scores
+                        if "scores" in data and isinstance(data["scores"], list):
+                            return [float(s) for s in data["scores"]]
+                    logger.warning(f"[Reranker] 无法解析响应: {data}")
+        except Exception as exc:
+            logger.warning(f"[Reranker] 调用失败: {exc}")
+        return None
+
 
 class KnowledgeBase:
     def __init__(self):

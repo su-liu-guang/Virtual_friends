@@ -2,37 +2,34 @@ import hashlib
 import aiohttp
 import re
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Callable
 from nonebot import logger
 from openai.types.chat import ChatCompletionMessageParam
-from .database import Message, ImageCache, Summary
+from .database import Message, ImageCache, Summary, ImportantEvent
 from .config import ConfigManager
 
 ERROR_CAPTION_PREFIXES = ("[图片识别失败", "[Vision Error")
 
-OUTPUT_FORMAT_TAIL_PROMPT = """
-[输出格式要求]
-你只输出人设正在说的话，不要输出任何额外说明、角色分析、旁白、动作描写或思考过程。
-你必须且只能输出一个完整标签块，严格使用以下格式：
+# ====== 格式约束提示词 — 放在 system 最开头 ======
+OUTPUT_FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
+你必须且只能输出以下格式：
 <persona_reply>你的回复内容</persona_reply>
 
 [硬性规则]
-1. 必须同时包含开始标签 <persona_reply> 和结束标签 </persona_reply>。
-2. 禁止输出第二个 persona_reply 标签块。
-3. 禁止输出 markdown 代码块、解释文字、前后缀说明。
-4. 在输出前先自检：若标签不闭合，必须先补全，再输出。
+1. 必须且只能输出一组完整的 <persona_reply> 和 </persona_reply>
+2. 标签外绝对不能有任何文字、说明、旁白、Markdown 标记
+3. 你的回复必须严格以 <persona_reply> 开头，以 </persona_reply> 结尾
+4. 禁止输出多组标签块
 
-[兜底模板]
-如果你不确定如何回答，也必须输出：
-<persona_reply>...</persona_reply>
+正确示例：<persona_reply>早上好呀，今天天气真不错呢！</persona_reply>
 """.strip()
 
-PERSONA_REPLY_RETRY_PROMPT = (
-    "你上次输出的 <persona_reply> 标签格式不完整或不合规。"
-    "现在只允许返回一个完整标签块，且必须闭合："
-    "<persona_reply>你的回复内容</persona_reply>。"
-    "禁止返回任何额外文字、解释、代码块或多标签。"
-)
+# ====== 格式修正重试 system prompt — 放在 retry context 最开头 ======
+FORMAT_RETRY_SYSTEM = """[格式修正 - 最高优先级]
+你之前的回复格式不正确。现在你必须且只能输出一组完整的标签：
+<persona_reply>你的回复内容</persona_reply>
+禁止任何标签外的文字、解释或 Markdown 符号。
+""".strip()
 
 
 def has_complete_persona_reply_tag(raw_text: Optional[str]) -> bool:
@@ -88,7 +85,6 @@ def sanitize_persona_reply(raw_text: Optional[str]) -> str:
         if re.match(r"^(?:说明|注[:：]|系统|旁白|内心|思考|analysis|assistant|user)\b", line, flags=re.IGNORECASE):
             continue
 
-        # 例: 小明: 你好 / [小明]: 你好 / （小明）：你好
         line = re.sub(
             r"^(?:\[[^\]]{1,20}\]|（[^）]{1,20}）|\([^)]{1,20}\)|[A-Za-z\u4e00-\u9fa5]{1,20})\s*[：:]\s*",
             "",
@@ -108,28 +104,24 @@ def is_valid_caption(caption: Optional[str]) -> bool:
         return False
     return not stripped.startswith(ERROR_CAPTION_PREFIXES)
 
+
 async def process_image_message(image_url: str, vision_client, caption_override: Optional[str] = None, is_sticker: bool = False) -> str:
     """处理图片消息,实现缓存优先策略"""
-    # 下载图片计算 MD5
     async with aiohttp.ClientSession() as session:
         async with session.get(image_url) as resp:
             image_data = await resp.read()
     
     md5 = hashlib.md5(image_data).hexdigest()
     
-    # 查询缓存
     cached = await ImageCache.get_or_none(md5=md5)
     if cached:
         return md5
     
-    # 如果有强制指定的描述（如表情包），则跳过 Vision API
     if caption_override:
         caption = caption_override
     else:
-        # 调用 Vision API
         caption = await vision_client.recognize_image(image_url, is_sticker=is_sticker)
     
-    # 写入缓存（仅在识别结果有效时）
     if is_valid_caption(caption):
         await ImageCache.create(md5=md5, caption=caption)
     else:
@@ -137,13 +129,46 @@ async def process_image_message(image_url: str, vision_client, caption_override:
     
     return md5
 
+
+async def generate_with_format_retry(
+    chat_client,
+    messages: List[ChatCompletionMessageParam],
+    validator: Callable[[str], bool],
+    retry_prompt_system: str,
+    max_retries: int = 1,
+) -> Optional[str]:
+    """
+    通用格式校验 + 重试函数。
+    
+    发送消息 → 校验格式 → 失败则将格式提示词作为 system 第一条重试。
+    retry 时 FORMAT_PROMPT 放在 context 最前面（system），原有消息保留在后。
+    """
+    raw = await chat_client.generate_chat_reply(messages, retry=3)
+    if not raw:
+        return None
+
+    if validator(raw):
+        return raw
+
+    # 格式校验失败，构造修正型重试
+    logger.warning("[Format] 首次输出格式不完整，构造修正重试")
+    retry_messages: List[ChatCompletionMessageParam] = [
+        {"role": "system", "content": retry_prompt_system},
+        *messages,
+    ]
+    repaired = await chat_client.generate_chat_reply(retry_messages, retry=1)
+    if repaired and validator(repaired):
+        return repaired
+
+    return raw  # 回退，交给 sanitize 清洗
+
+
 class ContextBuilder:
     """上下文构建器"""
     
-    def __init__(self, config_manager: ConfigManager, knowledge_base=None, memory_retriever=None):
+    def __init__(self, config_manager: ConfigManager, knowledge_base=None):
         self.config_manager = config_manager
         self.knowledge_base = knowledge_base
-        self.memory_retriever = memory_retriever
     
     async def build_context(
         self, 
@@ -162,19 +187,32 @@ class ContextBuilder:
             .limit(50)
             .all()
         )
-        # 还原为时间正序，便于模型理解对话流
         recent_msgs = list(reversed(recent_msgs_desc))
 
-        # L1 Layer - 最近一条 L1 摘要
-        latest_l1_summary = (
+        # ---- L1/L2/L3 全量摘要 ----
+        all_l1 = (
             await Summary.filter(group_id=group_id, level=1, is_archived=False)
-            .order_by("-created_at", "-id")
-            .first()
+            .order_by("-created_at")
+            .all()
+        )
+        all_l2 = (
+            await Summary.filter(group_id=group_id, level=2, is_archived=False)
+            .order_by("-created_at")
+            .all()
+        )
+        all_l3 = (
+            await Summary.filter(group_id=group_id, level=3, is_archived=False)
+            .order_by("-created_at")
+            .all()
         )
 
-        # Knowledge & Memory Layer
+        # ---- ImportantEvent 直连查询 ----
+        all_facts = await ImportantEvent.filter(
+            group_id=group_id, validity=True
+        ).order_by("-recorded_date").all()
+
+        # ---- Knowledge Layer ----
         knowledge_text = ""
-        memory_hits = []
         last_user_msg = None
         if recent_msgs:
             for msg in reversed(recent_msgs):
@@ -191,63 +229,67 @@ class ContextBuilder:
                 
                 knowledge_text += "\n[图片发送规则]\n参考资料中可能会提到图片资源，格式为 `(此处有一张图片，名称为：xxx)`。\n如果你认为展示该图片有助于回答用户问题，请在回复的末尾单独一行输出：`{{发送图片:xxx}}`。\n请只发送与问题高度相关的图片。\n"
 
-        if self.memory_retriever and last_user_msg and last_user_msg.content and len(last_user_msg.content) > 2:
-            memory_hits = await self.memory_retriever.retrieve(
-                group_id,
-                last_user_msg.content,
-                top_k=12,
-                final_k=5
-            )
-
-        # 时间信息
+        # ---- 时间信息 ----
         weekday_cn = ["一", "二", "三", "四", "五", "六", "日"]
         weekday = weekday_cn[current_time.isoweekday() - 1]
         time_str = f"{current_time.strftime('%Y年%m月%d日')} 星期{weekday} {current_time.strftime('%H:%M')}"
         
-        # System Layer
-        system_content = f"""{persona_prompt}
-
-[当前时间]: {time_str}
-[用户称呼]: {user_nickname}
-{knowledge_text}
-"""
-
-        # 默认尾部提示词：约束模型仅输出人设台词，便于后续正则清洗
-        system_content += f"\n\n{OUTPUT_FORMAT_TAIL_PROMPT}"
+        # ====== System Content — 格式要求放在最前面 ======
+        system_content = OUTPUT_FORMAT_PROMPT  # 第一行就是格式约束
         
-        # Memory Layer - 使用检索结果，减少 token
-        if memory_hits:
-            system_content += "\n[记忆回顾]:\n"
-            for item in memory_hits:
-                system_content += f"- ({item['tag']}) {item['content']}\n"
+        system_content += f"\n\n{persona_prompt}"
+        system_content += f"\n\n[当前时间]: {time_str}"
+        system_content += f"\n[用户称呼]: {user_nickname}"
+        system_content += f"\n{knowledge_text}"
 
-        if latest_l1_summary and latest_l1_summary.content:
-            system_content += (
-                "\n[最近L1总结]:\n"
-                f"时间范围: {latest_l1_summary.time_range}\n"
-                f"{latest_l1_summary.content.strip()}\n"
-            )
+        # ---- 全量摘要注入 ----
+        if all_l3:
+            system_content += "\n\n[宏观印象 L3]:\n"
+            for s3 in all_l3:
+                system_content += f"- ({s3.time_range}) {s3.content.strip()}\n"
+
+        if all_l2:
+            system_content += "\n\n[叙事概括 L2]:\n"
+            for s2 in all_l2:
+                system_content += f"- ({s2.time_range}) {s2.content.strip()}\n"
+
+        if all_l1:
+            system_content += "\n\n[近期详情 L1]:\n"
+            for s1 in all_l1:
+                system_content += f"- ({s1.time_range}) {s1.content.strip()}\n"
+
+        # ---- 事实注入（近期 vs 远期分层）----
+        if all_facts:
+            now_date = current_time.date()
+            recent_facts = [f for f in all_facts if (now_date - f.recorded_date).days <= 14]
+            old_facts = [f for f in all_facts if (now_date - f.recorded_date).days > 14]
+            if recent_facts:
+                system_content += "\n\n[近期重要事实]:\n"
+                for f in recent_facts:
+                    prefix = "[高] " if f.confidence == "high" else ""
+                    system_content += f"- {prefix}{f.event_content}\n"
+            if old_facts:
+                system_content += "\n\n[更早的事实]:\n"
+                for f in old_facts[:10]:
+                    system_content += f"- {f.event_content}\n"
         
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_content.strip()}]
         
-        # Recent Layer - 消息已在上面获取，这里直接使用
+        # ---- Recent Layer ----
         for msg in recent_msgs:
             content = msg.content
             
-            # 图片处理
             if msg.image_md5:
                 cache = await ImageCache.get_or_none(md5=msg.image_md5)
                 if cache:
                     content = f"[系统注解: 图片内容为 {cache.caption}]\n{content}" if content else f"[系统注解: 图片内容为 {cache.caption}]"
             
-            # 添加时间戳 (本地时间)
             local_ts = msg.timestamp.astimezone()
             time_prefix = f"[{local_ts.strftime('%Y-%m-%d %H:%M')}] "
             
             if msg.role == "user" and msg.user_nickname:
                 content = f"{time_prefix}{msg.user_nickname}: {content}" if content else f"{time_prefix}{msg.user_nickname}: [无文本内容]"
             elif msg.role == "ai":
-                # AI 的消息也加上时间，保持格式一致
                 content = f"{time_prefix}{content}"
 
             role = "assistant" if msg.role == "ai" else "user"
@@ -256,5 +298,5 @@ class ContextBuilder:
                 "content": content
             }
             messages.append(message)
-        
+
         return messages

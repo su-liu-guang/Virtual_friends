@@ -1,5 +1,7 @@
+import json
+import re
 import asyncio
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Dict, Any
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from nonebot import logger
@@ -88,34 +90,45 @@ class ChatClient:
             base_url=self.base_url or "https://api.openai.com/v1"
         )
     
-    async def generate_response(self, messages: Sequence[ChatCompletionMessageParam], retry: int = 3) -> Optional[str]:
-        """生成对话回复"""
-        
-        kwargs = {
+    async def generate_response(
+        self,
+        messages: Sequence[ChatCompletionMessageParam],
+        retry: int = 3,
+        *,
+        temperature: float = 0.8,
+        disable_thinking: bool = False,
+        json_mode: bool = False,
+    ) -> Optional[str]:
+        """通用对话生成，支持参数化配置"""
+
+        kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0.8,
-            "extra_body":{}
+            "temperature": temperature,
         }
-        
+        if disable_thinking:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
         for attempt in range(retry):
             try:
-                logger.debug(f"[Chat] 尝试 {attempt + 1}/{retry}")
-                logger.debug(f"[Chat] 调用参数: model={self.model}, temperature=0.8")
+                logger.debug(f"[Chat] 尝试 {attempt + 1}/{retry} (temperature={temperature}, thinking={'off' if disable_thinking else 'on'}, json={json_mode})")
                 
                 response = await self.client.chat.completions.create(**kwargs)
                 
-                result = response.choices[0].message.content or "..."
+                message = response.choices[0].message
+                reasoning = getattr(message, 'reasoning_content', None)
+                if reasoning:
+                    logger.debug(f"[Chat] 思考过程 ({len(reasoning)} 字): {reasoning[:100]}...")
+                
+                result = message.content or "..."
                 logger.success(f"[Chat] 生成成功: {result[:100]}...")
                 if response.usage:
-                    prompt_tokens = response.usage.prompt_tokens
-                    completion_tokens = response.usage.completion_tokens
-                    total_tokens = response.usage.total_tokens
                     logger.debug(
-                        f"[Chat] Token 使用: total={total_tokens}, prompt={prompt_tokens}, completion={completion_tokens}"
+                        f"[Chat] Token 使用: total={response.usage.total_tokens}, "
+                        f"prompt={response.usage.prompt_tokens}, completion={response.usage.completion_tokens}"
                     )
-                else:
-                    logger.debug("[Chat] Token 使用: N/A")
                 return result
             
             except Exception as e:
@@ -126,131 +139,242 @@ class ChatClient:
                 await asyncio.sleep(2 ** attempt)
         
         return None
-    
+
+    async def generate_chat_reply(
+        self, messages: Sequence[ChatCompletionMessageParam], retry: int = 3
+    ) -> Optional[str]:
+        """生成聊天回复 - thinking=disabled 保持低延迟"""
+        return await self.generate_response(
+            messages, retry, temperature=0.8, disable_thinking=True
+        )
+
     async def generate_summary(self, context: str, retry: int = 3) -> Optional[str]:
-        """生成总结"""
-        logger.info(f"[Chat] 开始生成总结, 上下文长度: {len(context)}")
-        messages: List[ChatCompletionMessageParam] = [{
-            "role": "user",
-            "content": (
+        """生成 L1 摘要 - 格式提示词放在 system 第一条"""
+        FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
+请严格按以下格式输出，每条占一行：
+1. [时间/时间段] [昵称] 做了什么/说了什么，简要内容。
+2. [时间/时间段] [昵称] 做了什么/说了什么，简要内容。
+...
+禁止输出任何额外说明、Markdown 标记或代码块。
+""".strip()
+
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": FORMAT_PROMPT},
+            {"role": "user", "content": (
                 "总结以下群聊对话，忽略寒暄和无关细节，保留主要事件和讨论点。"
                 "每条总结务必包含：1) 触发时间（可用消息时间或大致时间段）；"
                 "2) 相关发送人昵称（ context 中的前缀已经包含昵称，请沿用）；"
                 "3) 简要内容。"
                 "以列表形式输出，确保可追溯到是谁在什么时候做了什么。\n\n"
                 f"{context}"
-            )
-        }]
-        result = await self.generate_response(messages, retry)
-        if result is None:
+            )},
+        ]
+
+        result = await self.generate_response(
+            messages, retry, temperature=0.5, disable_thinking=True
+        )
+        if not result:
             logger.error("[Chat] 生成总结失败，返回 None")
-        return result
-    
-    async def extract_facts(self, context: str, retry: int = 3) -> List[str]:
-        """提取重要事实"""
-        logger.info(f"[Chat] 开始提取事实, 上下文长度: {len(context)}")
-        messages: List[ChatCompletionMessageParam] = [{
-            "role": "user",
-            "content": (
-                "分析对话并提取长期记忆。请严格遵守以下过滤漏斗："
-                "直接丢弃： 闲聊、情绪宣泄、模糊的打算（如“我想去...”）、对当下的评论。"
-                "仅保留： 确定的行动计划（时间/地点）、永久性的人物属性（生日/过敏/职业）、对他人的郑重承诺。"
-                "绝大多数情况下你应该返回“无”。"
-                "仅当必定需要记录时，输出格式：[时间][昵称] ...（限2条）"
-                "在输出前，请自问：'这条信息值得在一个月后被重新提起吗？' 如果不是，请输出无。\n\n"
-                f"{context}"
+            return None
+
+        # 格式校验：至少要有数字编号行
+        if not any(line.strip()[:1].isdigit() for line in result.split("\n") if line.strip()):
+            logger.warning("[Summary] 格式异常，尝试修复重试")
+            fix_msg: ChatCompletionMessageParam = {
+                "role": "user",
+                "content": (
+                    "你的输出格式不正确。请重新输出，严格按编号列表格式，每条以数字开头。"
+                    "禁止任何额外文字。\n\n原始对话:\n" + context
+                ),
+            }
+            result = await self.generate_response(
+                [messages[0], fix_msg], 1, temperature=0.3, disable_thinking=True
             )
-        }]
-        
-        result = await self.generate_response(messages, retry)
-        if result is None:
-            logger.error("[Chat] 提取事实失败，返回空列表")
+
+        return result
+
+    async def extract_facts_v2(self, context: str, retry: int = 3) -> List[Dict[str, Any]]:
+        """
+        提取重要事实，使用 reasoning + JSON 结构输出。
+        格式提示词放在 system 第一条。
+        """
+        FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
+你必须且只能输出一个严格的 JSON 数组。禁止任何其他输出。
+每个元素的结构：
+{"type": "plan|attribute|commitment", "person": "昵称", "content": "用第三人称叙述的事实", "confidence": "high|medium"}
+
+没有值得记录的信息时输出：[]
+
+正确示例：
+[
+  {"type": "plan", "person": "小明", "content": "小明下周三去上海出差，周四返回", "confidence": "high"},
+  {"type": "attribute", "person": "小红", "content": "小红生日是 5 月 20 日", "confidence": "high"}
+]
+""".strip()
+
+        TASK_PROMPT = """分析以下群聊对话，提取值得永久记忆的信息。
+
+[判断标准 - 仅记录以下三类]
+1. plan（计划）：包含具体时间/地点的约定
+2. attribute（属性）：生日、职业、过敏原、住址城市、专业领域等
+3. commitment（承诺）：认真表达的承诺（排除"改天请你吃饭"类客套）
+
+[绝对排除]
+日常闲聊、情绪表达（"今天好累"）、模糊意图（"我想学日语"——没有计划时间不算）、对当下事件的评论（"这游戏真好玩"）、任何一个月内失去意义的内容。
+
+对话记录：
+""" + context
+
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": FORMAT_PROMPT},
+            {"role": "user", "content": TASK_PROMPT},
+        ]
+
+        raw = await self.generate_response(
+            messages, retry, temperature=0.3
+            # 不传 disable_thinking，启用推理
+        )
+        if not raw:
             return []
-        if result.strip() == "无":
-            logger.info("[Chat] 未提取到任何事实")
-            return []
-        
-        facts = [line.strip() for line in result.split("\n") if line.strip() and not line.startswith("#")]
-        logger.success(f"[Chat] 提取到 {len(facts)} 条事实")
-        return facts
+
+        # 格式校验 + 重试
+        for attempt in range(2):
+            try:
+                cleaned = raw.strip()
+                if cleaned.startswith("```"):
+                    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+                    cleaned = re.sub(r"\s*```$", "", cleaned)
+                data = json.loads(cleaned)
+                if isinstance(data, list):
+                    return [item for item in data if isinstance(item, dict)]
+                if isinstance(data, dict):
+                    inner = data.get("facts") or data.get("results") or data.get("items")
+                    if isinstance(inner, list):
+                        return inner
+                logger.warning(f"[Facts] 非预期结构: {type(data)}")
+            except Exception as e:
+                logger.warning(f"[Facts] JSON 解析失败 (attempt {attempt+1}): {e}")
+
+            if attempt == 0:
+                fix_msg: ChatCompletionMessageParam = {
+                    "role": "user",
+                    "content": (
+                        "你的输出 JSON 格式不正确。请严格按 system prompt 中定义的格式重新输出，"
+                        "只输出 JSON 数组，不要带任何其他内容。"
+                    ),
+                }
+                raw = await self.generate_response(
+                    [messages[0], fix_msg], 1, temperature=0.2, disable_thinking=True
+                )
+                if not raw:
+                    return []
+
+        logger.error("[Facts] 经过修复仍无法解析，返回空列表")
+        return []
+
+    async def extract_maintenance_actions(
+        self, prompt: str, retry: int = 2
+    ) -> Optional[Dict[str, Any]]:
+        """
+        AI 审核事实库：标记过期、检测矛盾、建议合并。
+        格式提示词放在 system 第一条。
+        """
+        FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
+你必须且只能输出一个严格的 JSON 对象，格式：
+{
+  "expire": [],
+  "conflicts": [{"obsolete": 0, "keep": 0, "reason": "冲突原因"}],
+  "merges": [{"merge_ids": [], "merged_content": "合并后的完整内容"}]
+}
+禁止任何额外文字、Markdown 标记或代码块。
+""".strip()
+
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": FORMAT_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+
+        raw = await self.generate_response(
+            messages, retry, temperature=0.3, json_mode=True
+        )
+        if not raw:
+            return None
+
+        for attempt in range(2):
+            try:
+                cleaned = raw.strip()
+                if cleaned.startswith("```"):
+                    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+                    cleaned = re.sub(r"\s*```$", "", cleaned)
+                data = json.loads(cleaned)
+                if isinstance(data, dict):
+                    return data
+            except Exception as e:
+                logger.warning(f"[Maintenance] JSON 解析失败 (attempt {attempt+1}): {e}")
+
+            if attempt == 0:
+                fix_msg: ChatCompletionMessageParam = {
+                    "role": "user",
+                    "content": "你的 JSON 格式不正确，请仅重新输出正确的 JSON 对象，禁止额外内容。",
+                }
+                raw = await self.generate_response(
+                    [messages[0], fix_msg], 1, temperature=0.2, disable_thinking=True
+                )
+                if not raw:
+                    return None
+
+        return None
 
     async def generate_daily_summary_data(self, context: str, retry: int = 3) -> str:
-        """生成每日总结的结构化数据 (JSON)"""
-        logger.info(f"[Chat] 开始生成每日总结数据, 上下文长度: {len(context)}")
-        
-        prompt = """
-你是一个群聊数据分析师。请根据提供的群聊记录，生成一份用于展示的 JSON 数据。
-请严格按照以下 JSON 格式输出，不要包含 markdown 代码块标记，直接输出 JSON 字符串。
-
+        """生成每日总结的结构化数据 (JSON) - 格式提示词放在 system 第一条"""
+        FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
+你必须且只能输出一个严格的 JSON 对象，结构如下：
 {
-  "stats": [
-    {"label": "称号1", "value": "用户A", "desc": "描述文本", "color": "red"},
-    {"label": "称号2", "value": "用户B", "desc": "描述文本", "color": "green"},
-    {"label": "称号3", "value": "用户C", "desc": "描述文本", "color": "yellow"},
-    {"label": "称号4", "value": "统计值", "desc": "描述文本", "color": "purple"}
-  ],
-  "topics": [
-    {"title": "话题标题", "hot": 5, "summary": "详细描述...", "users": ["参与者1", "参与者2"]},
-    {"title": "话题标题", "hot": 4, "summary": "详细描述...", "users": ["参与者3"]}
-  ],
-  "users": [
-    {
-      "name": "用户昵称", 
-      "title": "RPG职业/称号", 
-      "stats": {"发言数": 0}, 
-      "desc": "一句话角色描述"
-    },
-    {
-      "name": "用户昵称", 
-      "title": "RPG职业/称号", 
-      "stats": {"发言数": 0}, 
-      "desc": "一句话角色描述"
-    }
-  ],
-  "quotes": [
-    {"user": "用户昵称", "content": "金句内容..."},
-    {"user": "用户昵称", "content": "金句内容..."}
-  ],
-  "fortune": {
-    "luck": "大吉/中吉/小吉/凶...", 
-    "text": "宜xxx，忌xxx (简短有趣)"
-  }
+  "stats": [{"label": "称号", "value": "用户", "desc": "描述", "color": "red|green|yellow|purple|blue"}],
+  "topics": [{"title": "话题", "hot": 整数1-5, "summary": "详细描述", "users": ["参与者"]}],
+  "users": [{"name": "昵称", "title": "RPG职业/称号", "stats": {"发言数": 0}, "desc": "角色描述"}],
+  "quotes": [{"user": "昵称", "content": "金句"}],
+  "fortune": {"luck": "大吉/中吉/小吉/凶", "text": "宜xxx，忌xxx"}
 }
+禁止任何额外文字、Markdown 标记或代码块。
+""".strip()
 
-要求：
+        TASK_PROMPT = f"""你是一个群聊数据分析师。请根据提供的群聊记录，生成一份用于展示的 JSON 数据。
+
+详细要求：
 1.数据清洗与 Stats：生成4个有趣的统计维度（如：龙王、复读机、熬夜冠军、开心果等），color 可选 red, green, yellow, purple, blue。请严格排除以下干扰数据：带有 [AI助手] 标签的用户、系统消息（如撤回、入群、文件上传）、以及纯表情包刷屏。
-2.Topics：提取 3-5 个主要讨论话题。hot 字段必须是 1 到 5 之间的整数（用于前端渲染进度条，不可输出小数）。 summary 字段请提供详细的叙述，包含起因、经过、结果，具体描述“谁说了什么”。在提到群友昵称时，请务必使用 [Avatar:昵称] 的格式。注意：如果昵称带有 [AI助手] 前缀（例如 [AI助手]妖精爱莉），在 [Avatar:...] 标签中必须去除该前缀，只写 [Avatar:妖精爱莉]。内容连贯，不要直接出现"起因" "经过" "结果"这些词。
-3.Users：选取1-5位今日最活跃或最有特色的群友（排除AI和系统消息），生成 RPG 风格的角色卡。stats 字段请填入 {"发言数": 0} 即可，真实数据将由代码自动填充。
+2.Topics：提取 3-5 个主要讨论话题。hot 字段必须是 1 到 5 之间的整数（用于前端渲染进度条，不可输出小数）。 summary 字段请提供详细的叙述，包含起因、经过、结果，具体描述"谁说了什么"。在提到群友昵称时，请务必使用 [Avatar:昵称] 的格式。注意：如果昵称带有 [AI助手] 前缀（例如 [AI助手]妖精爱莉），在 [Avatar:...] 标签中必须去除该前缀，只写 [Avatar:妖精爱莉]。内容连贯，不要直接出现"起因" "经过" "结果"这些词。
+3.Users：选取1-5位今日最活跃或最有特色的群友（排除AI和系统消息），生成 RPG 风格的角色卡。stats 字段请填入 {{"发言数": 0}} 即可，真实数据将由代码自动填充。
 4.Quotes：提取 3-5 条今日群内的搞笑、深刻或迷惑的发言（金句），忽略上下文缺失严重的短句。
 5.内容风格：幽默、轻松、稍微带点二次元或游戏梗。
 
 群聊记录：
-"""
-        
-        messages: List[ChatCompletionMessageParam] = [{
-            "role": "user",
-            "content": prompt + f"\n{context}"
-        }]
-        
+{context}"""
+
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": FORMAT_PROMPT},
+            {"role": "user", "content": TASK_PROMPT},
+        ]
+
         # 尝试使用 JSON 模式 (如果模型支持)
         try:
-            kwargs = {
-                "model": self.model,
-                "messages": messages,
-                "temperature": 0.8,
-                "response_format": {"type": "json_object"},
-            }
+            raw = await self.generate_response(
+                messages, retry, temperature=0.8, json_mode=True
+            )
+            if raw:
+                return raw
+        except Exception as e:
+            logger.debug(f"[DailySummary] JSON 模式不可用，回退普通模式: {e}")
 
-            response = await self.client.chat.completions.create(**kwargs)
-            
-            return response.choices[0].message.content or "{}"
-        except Exception:
-            # 回退到普通模式
-            fallback = await self.generate_response(messages, retry)
-            if not fallback:
-                logger.error("[Chat] 生成每日总结数据失败，返回空 JSON")
-                return "{}"
-            return fallback
+        # 回退到普通模式
+        fallback = await self.generate_response(
+            messages, retry, temperature=0.8, disable_thinking=True
+        )
+        if not fallback:
+            logger.error("[Chat] 生成每日总结数据失败，返回空 JSON")
+            return "{}"
+        return fallback
+
 
 class EmbeddingClient:
     """Embedding 模型客户端 - 专注文本向量化"""

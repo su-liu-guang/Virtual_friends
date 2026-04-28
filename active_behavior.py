@@ -11,7 +11,8 @@ from .logic import (
 	ContextBuilder,
 	sanitize_persona_reply,
 	has_complete_persona_reply_tag,
-	PERSONA_REPLY_RETRY_PROMPT,
+	FORMAT_RETRY_SYSTEM,
+	generate_with_format_retry,
 )
 from .clients import ChatClient
 from .database import Message
@@ -136,20 +137,16 @@ class ActiveBehaviorManager:
 		prompt = self._build_prompt(is_revival_mode, hours_since_user)
 		context.append({"role": "user", "content": prompt})
 
-		reply_raw = await self.chat_client.generate_response(context)
+		reply_raw = await generate_with_format_retry(
+			self.chat_client,
+			context,
+			validator=has_complete_persona_reply_tag,
+			retry_prompt_system=FORMAT_RETRY_SYSTEM,
+			max_retries=1,
+		)
 		if not reply_raw:
 			logger.warning(f"[Active] 群 {group_id} 主动消息生成失败，已忽略")
 			return
-
-		if not has_complete_persona_reply_tag(reply_raw):
-			logger.warning(f"[Active] 群 {group_id} 首次输出标签不完整，尝试一次格式修复重试")
-			repair_context = [
-				*context,
-				{"role": "user", "content": PERSONA_REPLY_RETRY_PROMPT},
-			]
-			repaired = await self.chat_client.generate_response(repair_context, retry=1)
-			if repaired:
-				reply_raw = repaired
 
 		reply = sanitize_persona_reply(reply_raw)
 		
