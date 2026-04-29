@@ -119,7 +119,11 @@ def sanitize_persona_reply(raw_text: Optional[str]) -> str:
         if line:
             cleaned_lines.append(line)
 
-    return "\n".join(cleaned_lines).strip()
+    result = "\n".join(cleaned_lines).strip()
+    result = re.sub(r"（[^）]*）", "", result)
+    result = re.sub(r"\([^)]*\)", "", result)
+    result = re.sub(r"\s{2,}", " ", result).strip()
+    return result
 
 
 def is_valid_caption(caption: Optional[str]) -> bool:
