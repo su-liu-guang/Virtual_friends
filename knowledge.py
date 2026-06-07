@@ -62,6 +62,8 @@ class RerankerClient:
 
 
 class KnowledgeBase:
+    INDEX_VERSION = 2
+
     def __init__(self):
         self.base_path = Path("data/Virtual_friends/knowledge")
         self.index_path = self.base_path / "knowledge_index.json"
@@ -72,6 +74,7 @@ class KnowledgeBase:
         self.chunks: List[Dict] = []
         self.image_map: Dict[str, str] = {} 
         self.file_hashes: Dict[str, str] = {} # 记录文件哈希 relative_path -> md5
+        self.index_version = self.INDEX_VERSION
         
         # 确保目录存在
         self.base_path.mkdir(parents=True, exist_ok=True)
@@ -82,15 +85,26 @@ class KnowledgeBase:
         if self.index_path.exists():
             try:
                 data = json.loads(self.index_path.read_text(encoding="utf-8"))
-                self.chunks = data.get("chunks", [])
-                self.image_map = data.get("image_map", {})
-                self.file_hashes = data.get("file_hashes", {})
-                logger.info(f"加载现有索引: {len(self.chunks)} 个片段, {len(self.image_map)} 张图片")
+                self.index_version = int(data.get("version", 1) or 1)
+                if self.index_version != self.INDEX_VERSION:
+                    logger.warning(
+                        f"知识库索引版本 {self.index_version} != {self.INDEX_VERSION}，将自动重建"
+                    )
+                    self.chunks = []
+                    self.image_map = {}
+                    self.file_hashes = {}
+                    self.index_version = self.INDEX_VERSION
+                else:
+                    self.chunks = data.get("chunks", [])
+                    self.image_map = data.get("image_map", {})
+                    self.file_hashes = data.get("file_hashes", {})
+                    logger.info(f"加载现有索引: {len(self.chunks)} 个片段, {len(self.image_map)} 张图片")
             except Exception as e:
                 logger.error(f"加载索引失败，将重建: {e}")
                 self.chunks = []
                 self.image_map = {}
                 self.file_hashes = {}
+                self.index_version = self.INDEX_VERSION
 
         # 2. 扫描磁盘文件并执行增量更新
         await self._incremental_update()
@@ -235,7 +249,8 @@ class KnowledgeBase:
                 if not text.strip():
                     continue
                     
-                embedding = await self.embedding_client.get_embedding(text)
+                embed_text = f"来源文件: {rel_source_path}\n标题: {title}\n正文:\n{text}"
+                embedding = await self.embedding_client.get_embedding(embed_text)
                 if embedding:
                     self.chunks.append({
                         "title": title,
@@ -248,6 +263,7 @@ class KnowledgeBase:
 
     def _save_index(self):
         data = {
+            "version": self.INDEX_VERSION,
             "chunks": self.chunks,
             "image_map": self.image_map,
             "file_hashes": self.file_hashes
@@ -255,7 +271,7 @@ class KnowledgeBase:
         self.index_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-    async def search(self, query: str, top_k: int = 3, min_score: float = 0.2) -> List[Dict]:
+    async def search(self, query: str, top_k: int = 3, min_score: float = 0.1) -> List[Dict]:
         """搜索相关片段，低于阈值则视为不相关，避免乱插参考资料；可选 rerank 优化排序"""
         if not self.chunks:
             return []
@@ -278,10 +294,15 @@ class KnowledgeBase:
         # 阈值过滤
         best_score = scored_chunks[0][0]
         if best_score < min_score:
-            logger.debug(
+            logger.info(
                 f"[Knowledge] 最高相似度 {best_score:.3f} < 阈值 {min_score}, 不插入参考资料"
             )
             return []
+
+        logger.info(
+            f"[Knowledge] 命中参考资料: score={best_score:.3f}, "
+            f"source={scored_chunks[0][1].get('source')}, title={scored_chunks[0][1].get('title')}"
+        )
 
         # 可选重排序
         if self.reranker.enabled:

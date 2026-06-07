@@ -36,6 +36,9 @@ OUTPUT_FORMAT_PROMPT = """[输出格式硬性约束 - 必须严格遵守]
 # ====== 放在 system prompt 末尾的格式再次提醒（利用近因效应）======
 FORMAT_REMINDER = "\n\n[再次强调] 你的回复必须等于 <persona_reply>回复内容</persona_reply>，标签外零字符。"
 
+# ====== 放在最后一条 user 消息末尾的短格式提醒（利用近因效应）======
+SHORT_FORMAT_REMINDER = "\n\n[输出要求] 只输出 <persona_reply>回复内容</persona_reply>"
+
 # ====== 格式修正重试 system prompt — 放在 retry context 最开头 ======
 FORMAT_RETRY_SYSTEM = """[格式修正 - 最高优先级]
 你上一次的回复格式不正确。请重新回复，严格输出：
@@ -221,11 +224,11 @@ class ContextBuilder:
         config = self.config_manager.get_instance_config(group_id)
         persona_prompt = self.config_manager.get_persona_prompt(config["persona_name"])
         
-        # Recent Layer - 最近 50 条消息（无论是否已处理）
+        # Recent Layer - 最近 25 条消息（无论是否已处理）
         recent_msgs_desc = (
             await Message.filter(group_id=group_id)
             .order_by("-timestamp", "-id")
-            .limit(50)
+            .limit(25)
             .all()
         )
         recent_msgs = list(reversed(recent_msgs_desc))
@@ -233,19 +236,19 @@ class ContextBuilder:
         # ---- L1/L2/L3 摘要（加 limit 截断） ----
         all_l1 = (
             await Summary.filter(group_id=group_id, level=1, is_archived=False)
-            .order_by("-created_at")
+            .order_by("created_at")
             .limit(15)
             .all()
         )
         all_l2 = (
             await Summary.filter(group_id=group_id, level=2, is_archived=False)
-            .order_by("-created_at")
+            .order_by("created_at")
             .limit(10)
             .all()
         )
         all_l3 = (
             await Summary.filter(group_id=group_id, level=3, is_archived=False)
-            .order_by("-created_at")
+            .order_by("created_at")
             .limit(5)
             .all()
         )
@@ -260,7 +263,24 @@ class ContextBuilder:
                     break
 
         if self.knowledge_base and last_user_msg and last_user_msg.content and len(last_user_msg.content) > 2:
-            chunks = await self.knowledge_base.search(last_user_msg.content, top_k=1)
+            query_parts = [last_user_msg.content]
+            context_count = 0
+            for msg in reversed(recent_msgs[:-1]):
+                if context_count >= 3:
+                    break
+                content = (msg.content or "").strip()
+                if not content:
+                    continue
+                if msg.role == "user":
+                    prefix = f"{msg.user_nickname}: " if msg.user_nickname else ""
+                    query_parts.insert(0, f"{prefix}{content}")
+                    context_count += 1
+                elif msg.role == "ai":
+                    query_parts.insert(0, f"AI: {content[:50]}")
+                    context_count += 1
+
+            knowledge_query = "\n".join(query_parts)
+            chunks = await self.knowledge_base.search(knowledge_query, top_k=2)
             if chunks:
                 knowledge_text = "\n[参考资料]:\n"
                 for i, chunk in enumerate(chunks):
@@ -288,6 +308,12 @@ class ContextBuilder:
             system_content += "\n\n[叙事概括 L2]:\n"
             for s2 in all_l2:
                 system_content += f"- ({s2.time_range}) {s2.content.strip()}\n"
+
+        # L1 近期详情 — 一天内基本不变，准静态
+        if all_l1:
+            system_content += "\n\n[近期详情 L1]:\n"
+            for s1 in all_l1:
+                system_content += f"- ({s1.time_range}) {s1.content.strip()}\n"
 
         system_content += FORMAT_REMINDER
 
@@ -319,35 +345,26 @@ class ContextBuilder:
                 message["reasoning_content"] = msg.reasoning_content  # type: ignore[index]
             messages.append(message)
 
-        # ====== 动态上下文前缀：L1 + 参考资料 注入到第一条 user 消息 ======
-        context_parts: List[str] = []
-
-        if all_l1:
-            lines = ["[近期详情 L1]:"]
-            for s1 in all_l1:
-                lines.append(f"- ({s1.time_range}) {s1.content.strip()}")
-            context_parts.append("\n".join(lines))
-
-        if knowledge_text.strip():
-            context_parts.append(knowledge_text.strip())
-
-        context_prefix = "\n\n".join(context_parts) + "\n\n---\n\n" if context_parts else ""
-
-        format_instructions = _build_user_message_instructions()
+        # ====== 第一条 user 不再注入动态知识库，避免污染后续历史消息缓存 ======
+        context_prefix = ""
         for m in messages:
             if m["role"] == "user":
                 cur = m.get("content", "")
                 if isinstance(cur, str):
-                    m["content"] = context_prefix + cur + format_instructions  # type: ignore[index]
+                    m["content"] = context_prefix + cur  # type: ignore[index]
                 break
 
-        # ====== 时间前缀：注入到最后一条 user 消息（紧邻当前问题）======
+        # ====== 参考资料 + 时间前缀：注入到最后一条 user 消息（紧邻当前问题）======
         time_prefix = f"[当前时间]: {time_str}\n[当前对话对象]: {user_nickname}\n\n"
+        last_user_prefix = time_prefix
+        if knowledge_text.strip():
+            last_user_prefix = knowledge_text.strip() + "\n\n" + time_prefix
+
         for i in range(len(messages) - 1, -1, -1):
             if messages[i]["role"] == "user":
                 cur = messages[i].get("content", "")
                 if isinstance(cur, str):
-                    messages[i]["content"] = time_prefix + cur  # type: ignore[index]
+                    messages[i]["content"] = last_user_prefix + cur + SHORT_FORMAT_REMINDER  # type: ignore[index]
                 break
 
         return messages
