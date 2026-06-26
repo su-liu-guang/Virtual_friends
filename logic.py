@@ -45,6 +45,16 @@ FORMAT_RETRY_SYSTEM = """[格式修正 - 最高优先级]
 <persona_reply>你的回复内容</persona_reply>
 零额外字符，零标签外内容。""".strip()
 
+# ====== 知识库命中时注入的精确输出指令（优先级高于人设）======
+KNOWLEDGE_PRECISION_INSTRUCTION = """[资料库精确输出指令 - 优先级高于人设]
+
+检测到知识库中存在与该问题相关的参考资料，请严格遵守以下规则：
+1. 将参考资料中所有相关信息**完整、逐条**输出，不得省略关键细节
+2. 严格基于参考资料原文，**禁止编造或补充**参考资料中不存在的信息
+3. 如果资料包含具体数据、名称、步骤，必须全部包含在回复中
+4. 上述精确输出要求**高于人设聊天风格**——资料完整性优先于角色扮演
+5. 如果资料不足，明确说明，不要编造""".strip()
+
 def _build_user_message_instructions() -> str:
     """构建追加到首个 user 消息末尾的纯格式+沉浸指令。
     
@@ -280,7 +290,7 @@ class ContextBuilder:
                     context_count += 1
 
             knowledge_query = "\n".join(query_parts)
-            chunks = await self.knowledge_base.search(knowledge_query, top_k=2)
+            chunks = await self.knowledge_base.search(knowledge_query, top_k=5)
             if chunks:
                 knowledge_text = "\n[参考资料]:\n"
                 for i, chunk in enumerate(chunks):
@@ -358,7 +368,7 @@ class ContextBuilder:
         time_prefix = f"[当前时间]: {time_str}\n[当前对话对象]: {user_nickname}\n\n"
         last_user_prefix = time_prefix
         if knowledge_text.strip():
-            last_user_prefix = knowledge_text.strip() + "\n\n" + time_prefix
+            last_user_prefix = knowledge_text.strip() + "\n\n" + KNOWLEDGE_PRECISION_INSTRUCTION + "\n\n" + time_prefix
 
         for i in range(len(messages) - 1, -1, -1):
             if messages[i]["role"] == "user":
