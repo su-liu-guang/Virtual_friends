@@ -273,23 +273,7 @@ class ContextBuilder:
                     break
 
         if self.knowledge_base and last_user_msg and last_user_msg.content and len(last_user_msg.content) > 2:
-            query_parts = [last_user_msg.content]
-            context_count = 0
-            for msg in reversed(recent_msgs[:-1]):
-                if context_count >= 3:
-                    break
-                content = (msg.content or "").strip()
-                if not content:
-                    continue
-                if msg.role == "user":
-                    prefix = f"{msg.user_nickname}: " if msg.user_nickname else ""
-                    query_parts.insert(0, f"{prefix}{content}")
-                    context_count += 1
-                elif msg.role == "ai":
-                    query_parts.insert(0, f"AI: {content[:50]}")
-                    context_count += 1
-
-            knowledge_query = "\n".join(query_parts)
+            knowledge_query = last_user_msg.content
             chunks = await self.knowledge_base.search(knowledge_query, top_k=5)
             if chunks:
                 knowledge_text = "\n[参考资料]:\n"
