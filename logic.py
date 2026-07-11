@@ -55,6 +55,31 @@ KNOWLEDGE_PRECISION_INSTRUCTION = """[资料库精确输出指令 - 优先级高
 4. 上述精确输出要求**高于人设聊天风格**——资料完整性优先于角色扮演
 5. 如果资料不足，明确说明，不要编造""".strip()
 
+# ====== 录取资料格式约束（临时硬编码，past_conditions.md 命中时注入）======
+PAST_CONDITIONS_FORMAT_RULES = """[录取数据输出格式 - 强制遵守]
+
+回答河南科技大学录取数据时，必须严格遵守以下规则：
+1. 必须注明**年份**（2024年或2025年）和**最低分位次**（或最低分排位）
+2. 如果是**专项计划**（国家专项、地方专项），必须明确标注「该数据为[国家/地方]专项计划录取数据」
+3. **禁止提及专业组编号**（如"102组""301组"），专业组编号对用户无意义
+4. 先列出普通批次数据，再列出专项计划数据
+
+[输出示例]
+根据2024年和2025年录取数据，xxx专业的最低分位次如下：
+**2025年：**
+- 普通批：最低分位次 90232
+- 国家专项计划：最低分位次 47010
+- 地方专项计划：最低分位次 47010
+- 本科提前批其他类：最低分位次 119532
+**2024年：**
+- 本科第一批：最低分排位 90628
+- 国家专项计划：最低分位次 47010
+- 地方专项计划：最低分位次 47010
+- 本科提前批：最低分排位 106610
+
+如果没有专项计划或提前批则不输出对应内容,所有数据必须真实,禁止输出没有依据的数据
+""".strip()
+
 def _build_user_message_instructions() -> str:
     """构建追加到首个 user 消息末尾的纯格式+沉浸指令。
     
@@ -265,6 +290,7 @@ class ContextBuilder:
 
         # ---- Knowledge Layer ----
         knowledge_text = ""
+        is_past_conditions = False
         last_user_msg = None
         if recent_msgs:
             for msg in reversed(recent_msgs):
@@ -281,6 +307,11 @@ class ContextBuilder:
                     knowledge_text += f"{i+1}. (来自 {chunk['source']} - {chunk['title']})\n{chunk['text']}\n"
                 
                 knowledge_text += "\n[图片发送规则]\n参考资料中可能会提到图片资源，格式为 `(此处有一张图片，名称为：xxx)`。\n如果你认为展示该图片有助于回答用户问题，请在回复的末尾单独一行输出：`{{发送图片:xxx}}`。\n请只发送与问题高度相关的图片。\n"
+
+                # ---- 临时：past_conditions.md 命中时注入格式约束 ----
+                is_past_conditions = any(
+                    c.get("source") == "past_conditions.md" for c in chunks
+                )
 
         # ---- 时间信息 ----
         weekday_cn = ["一", "二", "三", "四", "五", "六", "日"]
@@ -352,7 +383,10 @@ class ContextBuilder:
         time_prefix = f"[当前时间]: {time_str}\n[当前对话对象]: {user_nickname}\n\n"
         last_user_prefix = time_prefix
         if knowledge_text.strip():
-            last_user_prefix = knowledge_text.strip() + "\n\n" + KNOWLEDGE_PRECISION_INSTRUCTION + "\n\n" + time_prefix
+            precision = KNOWLEDGE_PRECISION_INSTRUCTION
+            if is_past_conditions:
+                precision += "\n\n" + PAST_CONDITIONS_FORMAT_RULES
+            last_user_prefix = knowledge_text.strip() + "\n\n" + precision + "\n\n" + time_prefix
 
         for i in range(len(messages) - 1, -1, -1):
             if messages[i]["role"] == "user":
