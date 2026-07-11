@@ -334,12 +334,6 @@ class ContextBuilder:
             for s2 in all_l2:
                 system_content += f"- ({s2.time_range}) {s2.content.strip()}\n"
 
-        # L1 近期详情 — 一天内基本不变，准静态
-        if all_l1:
-            system_content += "\n\n[近期详情 L1]:\n"
-            for s1 in all_l1:
-                system_content += f"- ({s1.time_range}) {s1.content.strip()}\n"
-
         system_content += FORMAT_REMINDER
 
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_content.strip()}]
@@ -370,23 +364,22 @@ class ContextBuilder:
                 message["reasoning_content"] = msg.reasoning_content  # type: ignore[index]
             messages.append(message)
 
-        # ====== 第一条 user 不再注入动态知识库，避免污染后续历史消息缓存 ======
-        context_prefix = ""
-        for m in messages:
-            if m["role"] == "user":
-                cur = m.get("content", "")
-                if isinstance(cur, str):
-                    m["content"] = context_prefix + cur  # type: ignore[index]
-                break
+        # ====== 动态上下文：L1 + 知识库 + 时间 注入到最后一条 user 消息（不在缓存前缀范围内）======
+        last_user_prefix = ""
 
-        # ====== 参考资料 + 时间前缀：注入到最后一条 user 消息（紧邻当前问题）======
+        if all_l1:
+            last_user_prefix += "[近期详情 L1]:\n"
+            for s1 in all_l1:
+                last_user_prefix += f"- ({s1.time_range}) {s1.content.strip()}\n"
+            last_user_prefix += "\n"
+
         time_prefix = f"[当前时间]: {time_str}\n[当前对话对象]: {user_nickname}\n\n"
-        last_user_prefix = time_prefix
+        last_user_prefix += time_prefix
         if knowledge_text.strip():
             precision = KNOWLEDGE_PRECISION_INSTRUCTION
             if is_past_conditions:
                 precision += "\n\n" + PAST_CONDITIONS_FORMAT_RULES
-            last_user_prefix = knowledge_text.strip() + "\n\n" + precision + "\n\n" + time_prefix
+            last_user_prefix = knowledge_text.strip() + "\n\n" + precision + "\n\n" + last_user_prefix
 
         for i in range(len(messages) - 1, -1, -1):
             if messages[i]["role"] == "user":
