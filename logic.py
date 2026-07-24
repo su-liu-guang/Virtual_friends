@@ -319,22 +319,32 @@ class ContextBuilder:
         time_str = f"{current_time.strftime('%Y年%m月%d日')} 星期{weekday} {current_time.strftime('%H:%M')}"
         
         # ====== SYSTEM MESSAGE: 静态 + 准静态（最大化 LLM 缓存命中）======
-        system_content = OUTPUT_FORMAT_PROMPT
-        system_content += f"\n\n{persona_prompt}"
+        section_format_prompt = OUTPUT_FORMAT_PROMPT
+        section_persona = f"\n\n{persona_prompt}"
+        section_l3 = ""
+        section_l2 = ""
+        section_l1 = ""
+        section_format_reminder = FORMAT_REMINDER
 
         # L3 宏观印象 — 数月不变，准静态
         if all_l3:
-            system_content += "\n\n[宏观印象 L3]:\n"
+            section_l3 = "\n\n[宏观印象 L3]:\n"
             for s3 in all_l3:
-                system_content += f"- ({s3.time_range}) {s3.content.strip()}\n"
+                section_l3 += f"- ({s3.time_range}) {s3.content.strip()}\n"
 
         # L2 叙事概括 — 数天不变，相对稳定
         if all_l2:
-            system_content += "\n\n[叙事概括 L2]:\n"
+            section_l2 = "\n\n[叙事概括 L2]:\n"
             for s2 in all_l2:
-                system_content += f"- ({s2.time_range}) {s2.content.strip()}\n"
+                section_l2 += f"- ({s2.time_range}) {s2.content.strip()}\n"
 
-        system_content += FORMAT_REMINDER
+        # L1 近期详情 — 每 50 条消息变化一次，49/50 次可命中缓存
+        if all_l1:
+            section_l1 = "\n\n[近期详情 L1]:\n"
+            for s1 in all_l1:
+                section_l1 += f"- ({s1.time_range}) {s1.content.strip()}\n"
+
+        system_content = section_format_prompt + section_persona + section_l3 + section_l2 + section_l1 + section_format_reminder
 
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_content.strip()}]
         
@@ -364,28 +374,47 @@ class ContextBuilder:
                 message["reasoning_content"] = msg.reasoning_content  # type: ignore[index]
             messages.append(message)
 
-        # ====== 动态上下文：L1 + 知识库 + 时间 注入到最后一条 user 消息（不在缓存前缀范围内）======
+        # ====== 动态上下文：知识库 + 时间 注入到最后一条 user 消息 ======
         last_user_prefix = ""
+        section_time_user = ""
 
-        if all_l1:
-            last_user_prefix += "[近期详情 L1]:\n"
-            for s1 in all_l1:
-                last_user_prefix += f"- ({s1.time_range}) {s1.content.strip()}\n"
-            last_user_prefix += "\n"
+        section_time_user = f"[当前时间]: {time_str}\n[当前对话对象]: {user_nickname}\n\n"
+        last_user_prefix += section_time_user
 
-        time_prefix = f"[当前时间]: {time_str}\n[当前对话对象]: {user_nickname}\n\n"
-        last_user_prefix += time_prefix
+        section_knowledge = ""
+        section_knowledge_instr = ""
         if knowledge_text.strip():
+            section_knowledge = knowledge_text.strip()
             precision = KNOWLEDGE_PRECISION_INSTRUCTION
             if is_past_conditions:
                 precision += "\n\n" + PAST_CONDITIONS_FORMAT_RULES
-            last_user_prefix = knowledge_text.strip() + "\n\n" + precision + "\n\n" + last_user_prefix
+            section_knowledge_instr = precision
+            last_user_prefix = section_knowledge + "\n\n" + section_knowledge_instr + "\n\n" + last_user_prefix
+
+        section_short_reminder = SHORT_FORMAT_REMINDER
 
         for i in range(len(messages) - 1, -1, -1):
             if messages[i]["role"] == "user":
                 cur = messages[i].get("content", "")
                 if isinstance(cur, str):
-                    messages[i]["content"] = last_user_prefix + cur + SHORT_FORMAT_REMINDER  # type: ignore[index]
+                    messages[i]["content"] = last_user_prefix + cur + section_short_reminder  # type: ignore[index]
                 break
+
+        # ====== DEBUG: 各部分长度测量 ======
+        _total_system = len(section_format_prompt) + len(section_persona) + len(section_l3) + len(section_l2) + len(section_l1) + len(section_format_reminder)
+        _recent_total = sum(len(m.get("content", "")) for m in messages if m["role"] in ("user", "assistant"))
+        _total_all = _total_system + _recent_total
+        logger.info(
+            f"[Cache Profiler] group={group_id} total_chars={_total_all} | "
+            f"format_prompt={len(section_format_prompt)} persona={len(section_persona)} "
+            f"L3={len(section_l3)} L2={len(section_l2)} L1={len(section_l1)} "
+            f"format_reminder={len(section_format_reminder)} "
+            f"sys_total={_total_system} ({_total_system*100//max(_total_all,1)}%) | "
+            f"recent_msgs={_recent_total} ({_recent_total*100//max(_total_all,1)}%) "
+            f"count={len(recent_msgs)} | "
+            f"knowledge={len(section_knowledge)} "
+            f"k_instr={len(section_knowledge_instr)} time_user={len(section_time_user)} "
+            f"short_rem={len(section_short_reminder)}"
+        )
 
         return messages

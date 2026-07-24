@@ -123,7 +123,7 @@ class MemoryScheduler:
         prompt = f"将以下多条摘要合并为一条更高层次的概括,保留关键信息:\n\n{combined_text}"
         
         messages: List[ChatCompletionMessageParam] = [{"role": "user", "content": prompt}]
-        merged_summary = await self.chat_client.generate_response(messages, retry=3, temperature=0.5, disable_thinking=True)
+        merged_summary = await self.chat_client.generate_response(messages, retry=3, temperature=0.5, thinking_mode="disabled")
         if not merged_summary:
             logger.error(f"[Scheduler] 合并摘要失败，已跳过写入 (group={group_id})")
             return
