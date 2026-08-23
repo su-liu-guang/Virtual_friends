@@ -10,10 +10,11 @@ NoneBot2 插件，为 QQ 群聊提供 AI 驱动的虚拟好友。功能包括：
 __init__.py         # 入口：命令注册、生命周期、消息处理主循环
 active_behavior.py  # 主动行为：自主判断何时在群里发言
 clients.py          # AI 服务封装：Chat/Embedding 客户端
+cache_metrics.py    # DeepSeek prompt cache 用量 JSONL 监控
 config.py           # 配置管理：personas.json + groups.json 读写
 database.py         # Tortoise ORM 模型：消息、摘要、永久图片文件与图片组映射
 knowledge.py        # 向量知识库：Markdown 文档 → 分块 → 向量 → 语义检索
-logic.py            # 上下文构建：system prompt 拼装、格式约束与清洗
+logic.py            # 上下文构建：system prompt 拼装、回复清洗与图片处理
 scheduler.py        # 后台调度：消息批量处理、摘要归档、事实库维护
 summary.py          # 日报生成：AI 结构化数据 + 本地统计 → HTML → JPEG
 ```
@@ -22,8 +23,8 @@ summary.py          # 日报生成：AI 结构化数据 + 本地统计 → HTML 
 
 ```
 用户消息 → __init__.py (handle_message)
-  ├─ knowledge.py (向量检索 → system prompt)
-  ├─ logic.py (ContextBuilder: 拼装 persona + 摘要 + 事实 + 最近消息)
+  ├─ knowledge.py (向量检索 → 当前请求的独立临时消息)
+  ├─ logic.py (ContextBuilder: 拼装 persona + 摘要 + 未处理消息)
   ├─ clients.py (ChatClient 统一生成文本与图像理解回复)
   └─ scheduler.py (后台异步入队: 批量摘要 + 事实提取)
        └─ active_behavior.py (定时主动发言)
@@ -34,18 +35,18 @@ summary.py          # 日报生成：AI 结构化数据 + 本地统计 → HTML 
 | 层级 | 触发条件 | 说明 |
 |------|---------|------|
 | L1 | 每 50 条消息 | 详细摘要 |
-| L2 | 每 80 条 L1 | 叙事概括 |
-| L3 | 每 30 条 L2 | 宏观印象 |
+| L2 | 每 20 条 L1 | 叙事概括 |
+| L3 | 每 10 条 L2 | 宏观印象 |
 
-所有未归档的 L1/L2/L3 摘要和有效事实**全量注入** system prompt（不经过向量检索）。
+未归档 L1/L2 全量注入 system prompt；L3 注入最新 5 条。当前摘要周期的未处理消息按时间追加，不使用滑动窗口。
 
 ## Key Patterns
 
-### 格式约束（强制 `<persona_reply>` 标签）
+### 回复生成与清洗
 
-- `logic.py` 输出 `OUTPUT_FORMAT_PROMPT`（内容在 `logic.py:14`），在所有 system prompt 最前面强制模型输出 `<persona_reply>...</persona_reply>`
-- `generate_with_format_retry()` (`logic.py:133`)：首次失败时用 `FORMAT_RETRY_SYSTEM` 重试一次
-- `sanitize_persona_reply()` (`logic.py:45`)：从标签中提取纯文本，移除元信息行
+- 普通聊天和主动发言均只执行一轮回复生成；API 请求异常仍沿用客户端重试策略
+- 不要求模型输出 XML 标签，也不会因为回复格式触发额外模型调用
+- `sanitize_reply()` 仅移除代码块、时间戳和常见元信息行
 
 ### JSON 格式提取
 
@@ -57,6 +58,8 @@ summary.py          # 日报生成：AI 结构化数据 + 本地统计 → HTML 
 ### 重试与容错
 
 - 所有 API 调用使用指数退避 (`asyncio.sleep(2**attempt)`)
+- L1/L2/L3 摘要必须少于 1000 字；不合格时最多额外重试 5 次，总计最多 6 次 API 请求
+- 摘要连续 6 次失败时不写入、不归档，也不机械截断
 - `json_mode` 回退到 `disable_thinking` 普通模式
 - `json_repair` 库兜底解析损坏 JSON
 
@@ -66,7 +69,7 @@ SQLite (aiosqlite, WAL mode)，路径：`data/Virtual_friends/memory.db`
 
 | 表 | 关键字段 | 用途 |
 |----|---------|------|
-| `messages` | group_id, role(user/ai), content, image_md5, is_processed | 聊天记录 |
+| `messages` | group_id, role, content, api_content, image_md5, is_processed | 清洗正文与 API 原始回复 |
 | `summaries` | group_id, level(1/2/3), content, time_range, is_archived | 三层摘要 |
 | `important_events` | group_id, event_content, fact_type, confidence, validity, expires_at | 结构化事实 |
 | `image_file_cache` | scoped_md5(PK), file_id, filename | 按 API Key 隔离的 DeepSeek Files API 永久文件引用 |
@@ -80,6 +83,8 @@ SQLite (aiosqlite, WAL mode)，路径：`data/Virtual_friends/memory.db`
 - `data/Virtual_friends/personas.json` — 人设定义
 - `data/Virtual_friends/groups.json` — 每群配置（persona 绑定、回复率、主动模式参数等）
 - `data/Virtual_friends/knowledge/` — Markdown 知识文档
+- 知识库中的文件或子目录名以 `_` 开头时暂不加载；移除前缀后会重新加入索引
+- `data/Virtual_friends/logs/cache_metrics.jsonl` — 缓存 token JSONL，10 MiB 轮转并保留 30 天
 
 ### 环境变量（通过 `.env.prod`）
 - `chat_api_key/base_url/model_name` — 文本模型
@@ -98,11 +103,9 @@ SQLite (aiosqlite, WAL mode)，路径：`data/Virtual_friends/memory.db`
 - `clients.py` 例外：每个客户端内部创建自己的 `ConfigManager()`（非 DI）
 
 ### Prompt 存放位置
-- 格式约束 prompt：`logic.py` 顶部常量
 - LLM 功能 prompt：内联在各 `clients.py` 方法中
 
 ### 特殊语法
-- `<persona_reply>...</persona_reply>` — AI 回复必须包裹在此标签内
 - `{{发送图片:xxx}}` — 触发图片发送宏
 - `[Avatar:昵称]` — 日报中嵌入 QQ 头像 HTML
 - `[AI助手]名称` — 日报中标记 bot 自身消息以排除
@@ -122,6 +125,9 @@ nb run
 
 # 依赖安装
 pip install -r requirements.txt
+
+# 缓存与摘要模拟测试
+python tests/test_cache_summary.py
 ```
 
 ## File Map

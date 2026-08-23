@@ -19,6 +19,7 @@ from .database import Message
 from .clients import ChatClient
 from .config import ConfigManager
 from .logic import collect_message_image_blocks
+from .cache_metrics import AICallMetadata
 
 class DailySummaryGenerator:
     def __init__(self, chat_client: ChatClient, config_manager: ConfigManager):
@@ -150,10 +151,11 @@ class DailySummaryGenerator:
         json_str = await self.chat_client.generate_daily_summary_data(
             context,
             image_blocks=ordered_image_blocks,
+            group_id=group_id,
         )
         t_end_ai = time.time()
         logger.info(f"[Performance] AI 生成耗时: {t_end_ai - t_start_ai:.2f}s")
-        logger.debug(f"AI Summary Raw Response: {json_str}")
+        logger.debug(f"AI 日报 JSON 已生成: chars={len(json_str)}")
         
         data = None
         # 尝试解析，如果失败则让 AI 修复
@@ -194,16 +196,23 @@ class DailySummaryGenerator:
                         # 复用 chat_client 的 generate_response 方法，构造一个临时的 messages
                         from openai.types.chat import ChatCompletionMessageParam
                         messages = [{"role": "user", "content": fix_prompt}]
-                        json_str = await self.chat_client.generate_response(messages, retry=1)
+                        json_str = await self.chat_client.generate_response(
+                            messages,
+                            retry=1,
+                            metadata=AICallMetadata(
+                                group_id=group_id,
+                                call_type="daily_summary_json_repair",
+                            ),
+                        )
                         if not json_str:
                             logger.error("请求 AI 修复 JSON 失败，未返回内容")
                             return None
-                        logger.debug(f"AI 修复后的 JSON: {json_str}")
+                        logger.debug(f"AI 修复后的 JSON: chars={len(json_str)}")
                     except Exception as fix_e:
                         logger.error(f"请求 AI 修复 JSON 失败: {fix_e}")
                         return None
                 else:
-                    logger.error(f"最终解析失败。Raw: {json_str}")
+                    logger.error(f"最终解析失败: chars={len(json_str)}")
                     return None
         
         if data is None:

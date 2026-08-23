@@ -22,15 +22,17 @@ from .logic import (
     PreparedImageBatch,
     prepare_image_messages,
     upload_image_files,
-    sanitize_persona_reply,
-    has_complete_persona_reply_tag,
-    FORMAT_RETRY_SYSTEM,
-    generate_with_format_retry,
+    sanitize_reply,
 )
 from .scheduler import MemoryScheduler
 from .active_behavior import ActiveBehaviorManager
 from .summary import DailySummaryGenerator
 from .knowledge import KnowledgeBase
+from .cache_metrics import (
+    AICallMetadata,
+    init_cache_metrics,
+    shutdown_cache_metrics,
+)
 
 __plugin_meta__ = PluginMetadata(
     name="Virtual Friends",
@@ -134,24 +136,26 @@ def is_command_like_message(text: str) -> bool:
 
 
 def format_context_for_debug(context: list) -> str:
-    lines = ["[VF Debug] 发送给 AI 的完整上下文:"]
+    """只记录上下文结构，不输出提示词、File ID 或对话正文。"""
+    lines = ["[VF Debug] 上下文结构:"]
     for idx, msg in enumerate(context, start=1):
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
         if isinstance(content, list):
-            safe_blocks = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "file":
-                    safe_blocks.append({"type": "file", "file_id": "<file_id omitted>"})
-                else:
-                    safe_blocks.append(block)
-            content = json.dumps(safe_blocks, ensure_ascii=False)
-        elif not isinstance(content, str):
-            try:
-                content = json.dumps(content, ensure_ascii=False)
-            except TypeError:
-                content = str(content)
-        lines.append(f"[{idx}] role={role}\n{content}")
+            text_chars = sum(
+                len(str(block.get("text", "")))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+            images = sum(
+                1
+                for block in content
+                if isinstance(block, dict) and block.get("type") in {"file", "image_url"}
+            )
+        else:
+            text_chars = len(content) if isinstance(content, str) else 0
+            images = 0
+        lines.append(f"[{idx}] role={role} chars={text_chars} images={images}")
     return "\n".join(lines)
 
 # ================= 工具函数 =================
@@ -208,7 +212,10 @@ async def handle_message(bot: Bot, event: MessageEvent):
     if has_image and not should_reply:
         return
 
-    logger.info(f"收到消息 [群组: {group_id}] [用户: {event.user_id}]: {text_content[:50]}...")
+    logger.info(
+        f"收到消息 [群组: {group_id}] [用户: {event.user_id}] "
+        f"[文本长度: {len(text_content)}] [图片: {int(has_image)}]"
+    )
     
     image_batch = PreparedImageBatch((), None)
     image_md5 = None
@@ -262,15 +269,17 @@ async def handle_message(bot: Bot, event: MessageEvent):
         current_time=timestamp,
     )
     logger.debug(format_context_for_debug(context))
-    response_raw, reasoning = await generate_with_format_retry(
-        chat_client,
+    chat_result = await chat_client.generate_chat_reply(
         context,
-        validator=has_complete_persona_reply_tag,
-        retry_prompt_system=FORMAT_RETRY_SYSTEM,
-        max_retries=1,
+        retry=3,
+        metadata=AICallMetadata(
+            group_id=group_id,
+            call_type="chat",
+            image_count=len(image_batch.images),
+        ),
     )
-
-    response = sanitize_persona_reply(response_raw)
+    response_raw, reasoning = chat_result if chat_result else (None, None)
+    response = sanitize_reply(response_raw)
     if not response:
         logger.error("[Chat] 生成回复为空，已跳过存储与发送")
         return
@@ -290,6 +299,7 @@ async def handle_message(bot: Bot, event: MessageEvent):
         weekday=get_weekday_label(reply_timestamp),
         is_processed=False,
         reasoning_content=reasoning,
+        api_content=response_raw,
     )
     
     # 处理图片发送指令
@@ -705,6 +715,7 @@ async def check_daily_summary():
 
 @driver.on_startup
 async def startup():
+    init_cache_metrics()
     await init_db()
     await config_manager.initialize()
     await knowledge_base.initialize()
@@ -755,3 +766,4 @@ async def shutdown():
     except Exception:
         # 忽略所有浏览器关闭异常
         pass
+    shutdown_cache_metrics()

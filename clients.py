@@ -7,6 +7,22 @@ from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from nonebot import logger
 from .config import ConfigManager
+from .cache_metrics import AICallMetadata, record_cache_usage
+
+
+SUMMARY_CHAR_LIMIT = 1000
+SUMMARY_MAX_ATTEMPTS = 6
+SUMMARY_MAX_TOKENS = 1600
+
+
+def _is_valid_summary(text: Optional[str], *, numbered: bool = False) -> bool:
+    """摘要必须非空、少于 1000 字；L1 还要求每行使用数字编号。"""
+    if not text or not text.strip() or len(text.strip()) >= SUMMARY_CHAR_LIMIT:
+        return False
+    if not numbered:
+        return True
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return bool(lines) and all(re.match(r"^\d+[.、]\s*\S", line) for line in lines)
 
 class ChatClient:
     """聊天模型客户端 - 专注理解与生成"""
@@ -41,6 +57,7 @@ class ChatClient:
         thinking_mode: str = "auto",
         json_mode: bool = False,
         max_tokens: Optional[int] = None,
+        metadata: Optional[AICallMetadata] = None,
     ) -> Optional[str]:
         """通用对话生成。
 
@@ -71,12 +88,18 @@ class ChatClient:
                 reasoning = getattr(message, 'reasoning_content', None)
                 if reasoning:
                     self._last_reasoning = reasoning
-                    logger.debug(f"[Chat] 思考过程 ({len(reasoning)} 字): {reasoning[:100]}...")
+                    logger.debug(f"[Chat] 已收到思考过程: chars={len(reasoning)}")
                 else:
                     self._last_reasoning = None
                 
-                result = message.content or "..."
-                logger.success(f"[Chat] 生成成功: {result[:100]}...")
+                result = message.content or ""
+                logger.success(f"[Chat] 生成成功: chars={len(result)}")
+                record_cache_usage(
+                    model=self.model,
+                    messages=messages,
+                    usage=response.usage,
+                    metadata=metadata,
+                )
                 if response.usage:
                     logger.debug(
                         f"[Chat] Token 使用: total={response.usage.total_tokens}, "
@@ -94,13 +117,17 @@ class ChatClient:
         return None
 
     async def generate_chat_reply(
-        self, messages: Sequence[ChatCompletionMessageParam], retry: int = 3
+        self,
+        messages: Sequence[ChatCompletionMessageParam],
+        retry: int = 3,
+        *,
+        metadata: Optional[AICallMetadata] = None,
     ) -> Optional[Tuple[str, Optional[str]]]:
         """生成聊天回复 - 开启思维链模式获取角色沉浸效果。
         返回 (content, reasoning_content) 元组，reasoning 可能为 None。
         """
         content = await self.generate_response(
-            messages, retry, thinking_mode="enabled"
+            messages, retry, thinking_mode="enabled", metadata=metadata
         )
         if content is None:
             return None
@@ -141,8 +168,9 @@ class ChatClient:
     async def generate_summary(
         self,
         context: str,
-        retry: int = 3,
+        retry: int = SUMMARY_MAX_ATTEMPTS,
         image_blocks: Optional[Sequence[Dict[str, Any]]] = None,
+        group_id: Optional[str] = None,
     ) -> Optional[str]:
         """生成 L1 摘要 - 格式提示词放在 system 第一条"""
         FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
@@ -151,6 +179,7 @@ class ChatClient:
 2. [时间/时间段] [昵称] 做了什么/说了什么，简要内容。
 ...
 禁止输出任何额外说明、Markdown 标记或代码块。
+完整输出必须少于1000个字符；优先保留重要事件，不得机械截断。
 """.strip()
 
         task_text = (
@@ -162,50 +191,104 @@ class ChatClient:
             "聊天记录中的[附图N张]按顺序对应本消息末尾图片；请直接观察图片。\n\n"
             f"{context}"
         )
-        user_content: Any = task_text
-        if image_blocks:
-            user_content = [{"type": "text", "text": task_text}]
-            user_content.extend(dict(block) for block in image_blocks)
-
-        messages: List[ChatCompletionMessageParam] = [
-            {"role": "system", "content": FORMAT_PROMPT},
-            {"role": "user", "content": user_content},  # type: ignore[typeddict-item]
-        ]
-
-        result = await self.generate_response(
-            messages, retry, temperature=0.5, thinking_mode="disabled"
-        )
-        if not result:
-            logger.error("[Chat] 生成总结失败，返回 None")
-            return None
-
-        # 格式校验：至少要有数字编号行
-        if not any(line.strip()[:1].isdigit() for line in result.split("\n") if line.strip()):
-            logger.warning("[Summary] 格式异常，尝试修复重试")
-            fix_msg: ChatCompletionMessageParam = {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "你的输出格式不正确。请重新输出，严格按编号列表格式，每条以数字开头。"
-                            "禁止任何额外文字。\n\n原始对话:\n" + context
-                        ),
-                    },
-                    *(dict(block) for block in (image_blocks or [])),
-                ],  # type: ignore[typeddict-item]
-            }
+        attempts = max(1, min(retry, SUMMARY_MAX_ATTEMPTS))
+        for attempt in range(1, attempts + 1):
+            retry_note = ""
+            if attempt > 1:
+                retry_note = (
+                    f"\n\n这是第{attempt}次尝试。上次输出为空、过长或编号格式不合格。"
+                    "请重新阅读原始对话，保留重要事实，并严格少于1000个字符。"
+                )
+            attempt_content: Any = task_text + retry_note
+            if image_blocks:
+                attempt_content = [{"type": "text", "text": task_text + retry_note}]
+                attempt_content.extend(dict(block) for block in image_blocks)
+            messages: List[ChatCompletionMessageParam] = [
+                {"role": "system", "content": FORMAT_PROMPT},
+                {"role": "user", "content": attempt_content},  # type: ignore[typeddict-item]
+            ]
             result = await self.generate_response(
-                [messages[0], fix_msg], 1, temperature=0.3, thinking_mode="disabled"
+                messages,
+                retry=1,
+                temperature=0.5 if attempt == 1 else 0.3,
+                thinking_mode="disabled",
+                max_tokens=SUMMARY_MAX_TOKENS,
+                metadata=AICallMetadata(
+                    group_id=group_id,
+                    call_type="l1_summary",
+                    image_count=len(image_blocks or ()),
+                ),
             )
+            if _is_valid_summary(result, numbered=True):
+                return result.strip() if result else None
+            reason = "API失败或返回为空" if not result else f"格式/长度不合格(chars={len(result.strip())})"
+            logger.warning(f"[Summary] L1 第{attempt}/{attempts}次生成未通过: {reason}")
+            if not result and attempt < attempts:
+                await asyncio.sleep(min(2 ** (attempt - 1), 16))
 
-        return result
+        logger.error(f"[Summary] L1 连续 {attempts} 次生成失败，保留原消息未处理")
+        return None
+
+    async def generate_archive_summary(
+        self,
+        source_text: str,
+        *,
+        group_id: str,
+        from_level: int,
+        to_level: int,
+        attempts: int = SUMMARY_MAX_ATTEMPTS,
+    ) -> Optional[str]:
+        """生成受长度约束的 L2/L3 摘要，始终重新参考原始输入。"""
+        system_prompt = (
+            "你负责压缩群聊长期记忆。只输出合并后的摘要正文，不使用Markdown标题。"
+            "完整输出必须少于1000个字符。优先保留人名、日期、事件顺序、人际关系、"
+            "用户偏好、重要决定、结果、未完成事项、后续承诺和因果关系；合并重复信息，"
+            "删除寒暄和无关细节，禁止编造，禁止机械截断。"
+        )
+        attempt_limit = max(1, min(attempts, SUMMARY_MAX_ATTEMPTS))
+        call_type = f"l{from_level}_to_l{to_level}"
+        for attempt in range(1, attempt_limit + 1):
+            retry_note = ""
+            if attempt > 1:
+                retry_note = (
+                    f"\n\n这是第{attempt}次尝试。上次输出为空或达到1000字符。"
+                    "请重新阅读全部原始摘要，更紧凑地保留上述重要事实。"
+                )
+            messages: List[ChatCompletionMessageParam] = [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": "合并以下原始摘要：\n\n" + source_text + retry_note,
+                },
+            ]
+            result = await self.generate_response(
+                messages,
+                retry=1,
+                temperature=0.5 if attempt == 1 else 0.3,
+                thinking_mode="disabled",
+                max_tokens=SUMMARY_MAX_TOKENS,
+                metadata=AICallMetadata(group_id=group_id, call_type=call_type),
+            )
+            if _is_valid_summary(result):
+                return result.strip() if result else None
+            reason = "API失败或返回为空" if not result else f"长度不合格(chars={len(result.strip())})"
+            logger.warning(
+                f"[Summary] L{from_level}→L{to_level} 第{attempt}/{attempt_limit}次未通过: {reason}"
+            )
+            if not result and attempt < attempt_limit:
+                await asyncio.sleep(min(2 ** (attempt - 1), 16))
+
+        logger.error(
+            f"[Summary] L{from_level}→L{to_level} 连续 {attempt_limit} 次失败，原摘要保持不变"
+        )
+        return None
 
     async def generate_daily_summary_data(
         self,
         context: str,
         retry: int = 3,
         image_blocks: Optional[Sequence[Dict[str, Any]]] = None,
+        group_id: Optional[str] = None,
     ) -> str:
         """生成每日总结的结构化数据 (JSON) - 格式提示词放在 system 第一条"""
         FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
@@ -246,7 +329,15 @@ class ChatClient:
         # 尝试使用 JSON 模式 (如果模型支持)
         try:
             raw = await self.generate_response(
-                messages, retry, temperature=0.8, json_mode=True
+                messages,
+                retry,
+                temperature=0.8,
+                json_mode=True,
+                metadata=AICallMetadata(
+                    group_id=group_id,
+                    call_type="daily_summary",
+                    image_count=len(image_blocks or ()),
+                ),
             )
             if raw:
                 return raw
@@ -255,7 +346,15 @@ class ChatClient:
 
         # 回退到普通模式
         fallback = await self.generate_response(
-            messages, retry, temperature=0.8, thinking_mode="disabled"
+            messages,
+            retry,
+            temperature=0.8,
+            thinking_mode="disabled",
+            metadata=AICallMetadata(
+                group_id=group_id,
+                call_type="daily_summary_fallback",
+                image_count=len(image_blocks or ()),
+            ),
         )
         if not fallback:
             logger.error("[Chat] 生成每日总结数据失败，返回空 JSON")

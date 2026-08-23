@@ -5,7 +5,7 @@ import aiohttp
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from nonebot import logger
 from openai.types.chat import ChatCompletionMessageParam
 from PIL import Image, UnidentifiedImageError
@@ -65,41 +65,6 @@ class PreparedImageBatch:
     def content_blocks(self) -> List[Dict[str, Any]]:
         return [image.to_content_block() for image in self.images]
 
-# ====== 格式约束提示词 — 放在 system 最开头 ======
-OUTPUT_FORMAT_PROMPT = """[输出格式硬性约束 - 必须严格遵守]
-
-你的完整回复必须精确等于以下格式，一个多余字符都不允许：
-
-<persona_reply>你的回复内容</persona_reply>
-
-规则：
-1. 回复的第一个字符必须是 <persona_reply> 的 <
-2. 回复的最后一个字符必须是 </persona_reply> 的 >
-3. 标签外不允许存在任何内容：无换行、无空格、无解释文字、无 Markdown
-4. 禁止在标签前添加时间戳、昵称、思考过程、旁白、引导语
-
-错误示例（这些都是被禁止的）：
-  [2025-01-01 12:00] <persona_reply>你好</persona_reply>
-  <persona_reply>你好</persona_reply>（希望你喜欢）
-  ````<persona_reply>你好</persona_reply>````
-  好的，我来回复：<persona_reply>你好</persona_reply>
-
-正确示例（这是唯一允许的格式）：
-<persona_reply>你好呀，今天天气真好！</persona_reply>
-""".strip()
-
-# ====== 放在 system prompt 末尾的格式再次提醒（利用近因效应）======
-FORMAT_REMINDER = "\n\n[再次强调] 你的回复必须等于 <persona_reply>回复内容</persona_reply>，标签外零字符。"
-
-# ====== 放在最后一条 user 消息末尾的短格式提醒（利用近因效应）======
-SHORT_FORMAT_REMINDER = "\n\n[输出要求] 只输出 <persona_reply>回复内容</persona_reply>"
-
-# ====== 格式修正重试 system prompt — 放在 retry context 最开头 ======
-FORMAT_RETRY_SYSTEM = """[格式修正 - 最高优先级]
-你上一次的回复格式不正确。请重新回复，严格输出：
-<persona_reply>你的回复内容</persona_reply>
-零额外字符，零标签外内容。""".strip()
-
 # ====== 知识库命中时注入的精确输出指令（优先级高于人设）======
 KNOWLEDGE_PRECISION_INSTRUCTION = """[资料库精确输出指令 - 优先级高于人设]
 
@@ -135,53 +100,14 @@ PAST_CONDITIONS_FORMAT_RULES = """[录取数据输出格式 - 强制遵守]
 如果没有专项计划或提前批则不输出对应内容,所有数据必须真实,禁止输出没有依据的数据
 """.strip()
 
-def _build_user_message_instructions() -> str:
-    """构建追加到首个 user 消息末尾的纯格式+沉浸指令。
-    
-    这些指令是纯静态文本，不影响 LLM 缓存命中率。
-    动态上下文（时间/用户/knowledge/L1摘要）已移到当前 user 消息前缀中。
-    """
-    return """
-
-[输出格式要求] 你的回复必须严格以 <persona_reply> 开头、以 </persona_reply> 结尾，标签外零字符。
-
-【角色沉浸要求】在你的思考过程（<think>标签内）中，请遵守以下规则：
-1. 请以角色第一人称进行内心独白，用括号包裹内心活动，例如"（心想：……）"或"(内心OS：……)"
-2. 用第一人称描写角色的内心感受，例如"我心想""我觉得""我暗自"等
-3. 思考内容应沉浸在角色中，通过内心独白分析剧情和规划回复"""
-
-
-def has_complete_persona_reply_tag(raw_text: Optional[str]) -> bool:
-    """检查是否包含完整的 persona_reply 标签对。"""
-    if not raw_text:
-        return False
-    text = raw_text.strip()
-    if not text:
-        return False
-    return re.search(r"<persona_reply>\s*.*?\s*</persona_reply>", text, flags=re.IGNORECASE | re.DOTALL) is not None
-
-
-def sanitize_persona_reply(raw_text: Optional[str]) -> str:
-    """清洗模型输出，仅保留人设台词内容。"""
+def sanitize_reply(raw_text: Optional[str]) -> str:
+    """清洗模型输出中的常见元信息。"""
     if not raw_text:
         return ""
 
     text = raw_text.strip()
     if not text:
         return ""
-
-    # 优先提取强约束标签中的内容
-    tagged = re.search(r"<persona_reply>\s*(.*?)\s*</persona_reply>", text, flags=re.IGNORECASE | re.DOTALL)
-    if tagged:
-        text = tagged.group(1).strip()
-    else:
-        # 半闭合容错: 只有开标签或只有闭标签时，尽量提取正文
-        open_only = re.search(r"<persona_reply>\s*(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
-        close_only = re.search(r"^(.*?)\s*</persona_reply>", text, flags=re.IGNORECASE | re.DOTALL)
-        if open_only:
-            text = open_only.group(1).strip()
-        elif close_only:
-            text = close_only.group(1).strip()
 
     # 去掉常见 markdown 包裹
     text = re.sub(r"^```(?:[a-zA-Z]+)?\s*", "", text)
@@ -451,50 +377,6 @@ async def collect_message_image_blocks(
     return selected
 
 
-async def generate_with_format_retry(
-    chat_client,
-    messages: List[ChatCompletionMessageParam],
-    validator: Callable[[str], bool],
-    retry_prompt_system: str,
-    max_retries: int = 1,
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    通用格式校验 + 重试函数。
-
-    发送消息 → 校验格式 → 失败则将格式提示词合并到已有 system 消息中重试。
-    返回 (raw_content, reasoning_content) 元组。
-    """
-    result = await chat_client.generate_chat_reply(messages, retry=3)
-    if not result:
-        return (None, None)
-
-    raw, reasoning = result
-
-    if validator(raw):
-        return (raw, reasoning)
-
-    # 格式校验失败，将修正指令合并到已有 system 消息中重试
-    logger.warning("[Format] 首次输出格式不完整，构造修正重试")
-    retry_messages: List[ChatCompletionMessageParam] = []
-    system_found = False
-    for msg in messages:
-        if msg["role"] == "system" and not system_found:
-            system_found = True
-            retry_messages.append({
-                "role": "system",
-                "content": retry_prompt_system + "\n\n---\n\n" + msg["content"]  # type: ignore[dict-item]
-            })
-        else:
-            retry_messages.append(msg)
-    repaired_result = await chat_client.generate_chat_reply(retry_messages, retry=1)
-    if repaired_result:
-        repaired_raw, repaired_reasoning = repaired_result
-        if validator(repaired_raw):
-            return (repaired_raw, repaired_reasoning)
-
-    return (raw, reasoning)  # 回退，交给 sanitize 清洗
-
-
 class ContextBuilder:
     """上下文构建器"""
     
@@ -519,39 +401,35 @@ class ContextBuilder:
         config = self.config_manager.get_instance_config(group_id)
         persona_prompt = self.config_manager.get_persona_prompt(config["persona_name"])
         
-        # Recent Layer - 最近 25 条消息（无论是否已处理）
-        recent_msgs_desc = (
-            await Message.filter(group_id=group_id)
-            .order_by("-timestamp", "-id")
-            .limit(25)
-            .all()
-        )
-        recent_msgs = list(reversed(recent_msgs_desc))
+        # 当前未处理消息在摘要周期内只会追加，不使用会逐条滑动的窗口。
+        recent_msgs = await Message.filter(
+            group_id=group_id,
+            is_processed=False,
+        ).order_by("timestamp", "id").all()
         historical_image_blocks = (
             await collect_message_image_blocks(recent_msgs, self.file_cache_scope)
             if self.file_cache_scope
             else {}
         )
 
-        # ---- L1/L2/L3 摘要（加 limit 截断） ----
+        # 归档阈值保证未归档 L1<20、L2<10，因此可完整加载。
         all_l1 = (
             await Summary.filter(group_id=group_id, level=1, is_archived=False)
-            .order_by("created_at")
-            .limit(15)
+            .order_by("created_at", "id")
             .all()
         )
         all_l2 = (
             await Summary.filter(group_id=group_id, level=2, is_archived=False)
-            .order_by("created_at")
-            .limit(10)
+            .order_by("created_at", "id")
             .all()
         )
-        all_l3 = (
+        latest_l3 = (
             await Summary.filter(group_id=group_id, level=3, is_archived=False)
-            .order_by("created_at")
+            .order_by("-created_at", "-id")
             .limit(5)
             .all()
         )
+        all_l3 = list(reversed(latest_l3))
 
         # ---- Knowledge Layer ----
         knowledge_text = ""
@@ -578,18 +456,11 @@ class ContextBuilder:
                     c.get("source") == "past_conditions.md" for c in chunks
                 )
 
-        # ---- 时间信息 ----
-        weekday_cn = ["一", "二", "三", "四", "五", "六", "日"]
-        weekday = weekday_cn[current_time.isoweekday() - 1]
-        time_str = f"{current_time.strftime('%Y年%m月%d日')} 星期{weekday} {current_time.strftime('%H:%M')}"
-        
-        # ====== SYSTEM MESSAGE: 静态 + 准静态（最大化 LLM 缓存命中）======
-        section_format_prompt = OUTPUT_FORMAT_PROMPT
-        section_persona = f"\n\n{persona_prompt}"
+        # ====== SYSTEM MESSAGE: 人设 + 分层记忆 ======
+        section_persona = persona_prompt
         section_l3 = ""
         section_l2 = ""
         section_l1 = ""
-        section_format_reminder = FORMAT_REMINDER
 
         # L3 宏观印象 — 数月不变，准静态
         if all_l3:
@@ -609,13 +480,13 @@ class ContextBuilder:
             for s1 in all_l1:
                 section_l1 += f"- ({s1.time_range}) {s1.content.strip()}\n"
 
-        system_content = section_format_prompt + section_persona + section_l3 + section_l2 + section_l1 + section_format_reminder
+        system_content = section_persona + section_l3 + section_l2 + section_l1
 
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_content.strip()}]
         
         # ---- Recent Layer ----
         for msg in recent_msgs:
-            content = msg.content
+            content = msg.api_content if msg.role == "ai" and msg.api_content else msg.content
 
             is_current_image_message = bool(
                 current_images and last_user_msg and msg.id == last_user_msg.id
@@ -631,9 +502,6 @@ class ContextBuilder:
             
             if msg.role == "user" and msg.user_nickname:
                 content = f"{time_prefix}{msg.user_nickname}: {content}" if content else f"{time_prefix}{msg.user_nickname}: [无文本内容]"
-            elif msg.role == "ai":
-                content = f"{time_prefix}{content}"
-
             role = "assistant" if msg.role == "ai" else "user"
             message: ChatCompletionMessageParam = {
                 "role": role,  # type: ignore
@@ -648,13 +516,7 @@ class ContextBuilder:
                 message["reasoning_content"] = msg.reasoning_content  # type: ignore[index]
             messages.append(message)
 
-        # ====== 动态上下文：知识库 + 时间 注入到最后一条 user 消息 ======
-        last_user_prefix = ""
-        section_time_user = ""
-
-        section_time_user = f"[当前时间]: {time_str}\n[当前对话对象]: {user_nickname}\n\n"
-        last_user_prefix += section_time_user
-
+        # 知识库属于本次检索结果，作为独立临时消息追加，不改写持久化用户消息。
         section_knowledge = ""
         section_knowledge_instr = ""
         if knowledge_text.strip():
@@ -663,37 +525,20 @@ class ContextBuilder:
             if is_past_conditions:
                 precision += "\n\n" + PAST_CONDITIONS_FORMAT_RULES
             section_knowledge_instr = precision
-            last_user_prefix = section_knowledge + "\n\n" + section_knowledge_instr + "\n\n" + last_user_prefix
-
-        section_short_reminder = SHORT_FORMAT_REMINDER
-
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i]["role"] == "user":
-                cur = messages[i].get("content", "")
-                if isinstance(cur, str):
-                    full_text = last_user_prefix + cur + section_short_reminder
-                    messages[i]["content"] = full_text  # type: ignore[index]
-                elif isinstance(cur, list):
-                    blocks = [dict(block) for block in cur]
-                    if blocks and blocks[0].get("type") == "text":
-                        blocks[0]["text"] = (
-                            last_user_prefix
-                            + str(blocks[0].get("text", ""))
-                            + section_short_reminder
-                        )
-                    else:
-                        blocks.insert(
-                            0,
-                            {
-                                "type": "text",
-                                "text": last_user_prefix + section_short_reminder,
-                            },
-                        )
-                    messages[i]["content"] = blocks  # type: ignore[index]
-                break
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "[本次请求的知识库参考资料]\n"
+                        + section_knowledge
+                        + "\n\n"
+                        + section_knowledge_instr
+                    ),
+                }
+            )
 
         # ====== DEBUG: 各部分长度测量 ======
-        _total_system = len(section_format_prompt) + len(section_persona) + len(section_l3) + len(section_l2) + len(section_l1) + len(section_format_reminder)
+        _total_system = len(section_persona) + len(section_l3) + len(section_l2) + len(section_l1)
         _recent_total = 0
         for message in messages:
             if message["role"] not in ("user", "assistant"):
@@ -710,15 +555,13 @@ class ContextBuilder:
         _total_all = _total_system + _recent_total
         logger.info(
             f"[Cache Profiler] group={group_id} total_chars={_total_all} | "
-            f"format_prompt={len(section_format_prompt)} persona={len(section_persona)} "
+            f"persona={len(section_persona)} "
             f"L3={len(section_l3)} L2={len(section_l2)} L1={len(section_l1)} "
-            f"format_reminder={len(section_format_reminder)} "
             f"sys_total={_total_system} ({_total_system*100//max(_total_all,1)}%) | "
             f"recent_msgs={_recent_total} ({_recent_total*100//max(_total_all,1)}%) "
             f"count={len(recent_msgs)} | "
             f"knowledge={len(section_knowledge)} "
-            f"k_instr={len(section_knowledge_instr)} time_user={len(section_time_user)} "
-            f"short_rem={len(section_short_reminder)}"
+            f"k_instr={len(section_knowledge_instr)}"
         )
 
         return messages

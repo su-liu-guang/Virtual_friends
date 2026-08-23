@@ -1,10 +1,12 @@
-from datetime import datetime
-
 from typing import List
 from nonebot import logger
-from openai.types.chat import ChatCompletionMessageParam
+from tortoise.transactions import in_transaction
 from .database import Message, Summary
 from .logic import collect_message_image_blocks
+
+
+L1_ARCHIVE_BATCH_SIZE = 20
+L2_ARCHIVE_BATCH_SIZE = 10
 
 class MemoryScheduler:
     """后台记忆整理调度器"""
@@ -39,7 +41,7 @@ class MemoryScheduler:
         messages = await Message.filter(
             group_id=group_id,
             is_processed=False
-        ).order_by("timestamp").limit(50).all()
+        ).order_by("timestamp", "id").limit(50).all()
         
         if not messages:
             return
@@ -94,6 +96,7 @@ class MemoryScheduler:
         summary_text = await self.chat_client.generate_summary(
             context,
             image_blocks=image_blocks,
+            group_id=group_id,
         )
         if not summary_text:
             logger.error(f"[Scheduler] 生成摘要失败，已跳过写入 (group={group_id})")
@@ -114,56 +117,74 @@ class MemoryScheduler:
     
     async def _check_archive(self, group_id: str):
         """检查并执行归档"""
-        # L1 -> L2 归档（阈值放宽到 80）
-        l1_count = await Summary.filter(
-            group_id=group_id,
-            level=1,
-            is_archived=False
-        ).count()
-        
-        if l1_count >= 80:
-            await self._archive_summaries(group_id, 1, 2, 80)
-        
-        # L2 -> L3 归档（阈值放宽到 30）
-        l2_count = await Summary.filter(
-            group_id=group_id,
-            level=2,
-            is_archived=False
-        ).count()
-        
-        if l2_count >= 30:
-            await self._archive_summaries(group_id, 2, 3, 30)
+        for from_level, to_level, batch_size in (
+            (1, 2, L1_ARCHIVE_BATCH_SIZE),
+            (2, 3, L2_ARCHIVE_BATCH_SIZE),
+        ):
+            while True:
+                count = await Summary.filter(
+                    group_id=group_id,
+                    level=from_level,
+                    is_archived=False,
+                ).count()
+                if count < batch_size:
+                    break
+                if not await self._archive_summaries(
+                    group_id, from_level, to_level, batch_size
+                ):
+                    break
     
-    async def _archive_summaries(self, group_id: str, from_level: int, to_level: int, batch_size: int):
-        """归档摘要到更高层级"""
+    async def _archive_summaries(
+        self,
+        group_id: str,
+        from_level: int,
+        to_level: int,
+        batch_size: int,
+    ) -> bool:
+        """归档摘要到更高层级，成功返回 True。"""
         summaries = await Summary.filter(
             group_id=group_id,
             level=from_level,
             is_archived=False
-        ).order_by("created_at").limit(batch_size).all()
+        ).order_by("created_at", "id").limit(batch_size).all()
         
         if not summaries:
-            return
+            return False
         
         combined_text = "\n\n".join([s.content for s in summaries])
-        prompt = f"将以下多条摘要合并为一条更高层次的概括,保留关键信息:\n\n{combined_text}"
-        
-        messages: List[ChatCompletionMessageParam] = [{"role": "user", "content": prompt}]
-        merged_summary = await self.chat_client.generate_response(messages, retry=3, temperature=0.5, thinking_mode="disabled")
+        merged_summary = await self.chat_client.generate_archive_summary(
+            combined_text,
+            group_id=group_id,
+            from_level=from_level,
+            to_level=to_level,
+        )
         if not merged_summary:
             logger.error(f"[Scheduler] 合并摘要失败，已跳过写入 (group={group_id})")
-            return
+            return False
         
         start_time = summaries[0].time_range.split("-")[0]
         end_time = summaries[-1].time_range.split("-")[-1]
         time_range = f"{start_time}-{end_time}"
         
-        await Summary.create(
-            group_id=group_id,
-            level=to_level,
-            content=merged_summary,
-            time_range=time_range
-        )
-        
         summary_ids = [s.id for s in summaries]
-        await Summary.filter(id__in=summary_ids).update(is_archived=True)
+        async with in_transaction() as connection:
+            await Summary.create(
+                group_id=group_id,
+                level=to_level,
+                content=merged_summary,
+                time_range=time_range,
+                using_db=connection,
+            )
+            updated = await Summary.filter(
+                id__in=summary_ids,
+                is_archived=False,
+            ).using_db(connection).update(is_archived=True)
+            if updated != len(summary_ids):
+                raise RuntimeError(
+                    f"归档摘要并发冲突: expected={len(summary_ids)}, updated={updated}"
+                )
+        logger.success(
+            f"[Scheduler] L{from_level}→L{to_level} 完成: "
+            f"group={group_id}, source={len(summary_ids)}, chars={len(merged_summary)}"
+        )
+        return True

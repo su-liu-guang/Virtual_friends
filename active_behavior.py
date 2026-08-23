@@ -9,14 +9,12 @@ from nonebot import logger
 from .config import ConfigManager
 from .logic import (
 	ContextBuilder,
-	sanitize_persona_reply,
-	has_complete_persona_reply_tag,
-	FORMAT_RETRY_SYSTEM,
-	generate_with_format_retry,
+	sanitize_reply,
 )
 from .clients import ChatClient
 from .database import Message
 from .scheduler import MemoryScheduler
+from .cache_metrics import AICallMetadata
 
 
 WEEKDAY_CN = ["一", "二", "三", "四", "五", "六", "日"]
@@ -134,21 +132,23 @@ class ActiveBehaviorManager:
 			current_time=now,
 		)
 
-		prompt = self._build_prompt(is_revival_mode, hours_since_user)
+		prompt = (
+			f"[{now.strftime('%Y-%m-%d %H:%M')}] 群友: "
+			+ self._build_prompt(is_revival_mode, hours_since_user)
+		)
 		context.append({"role": "user", "content": prompt})
 
-		reply_raw, reasoning = await generate_with_format_retry(
-			self.chat_client,
+		chat_result = await self.chat_client.generate_chat_reply(
 			context,
-			validator=has_complete_persona_reply_tag,
-			retry_prompt_system=FORMAT_RETRY_SYSTEM,
-			max_retries=1,
+			retry=3,
+			metadata=AICallMetadata(group_id=group_id, call_type="active_chat"),
 		)
-		if not reply_raw:
+		if not chat_result:
 			logger.warning(f"[Active] 群 {group_id} 主动消息生成失败，已忽略")
 			return
+		reply_raw, reasoning = chat_result
 
-		reply = sanitize_persona_reply(reply_raw)
+		reply = sanitize_reply(reply_raw)
 		
 		if not reply:
 			logger.warning(f"[Active] 群 {group_id} 生成的主动消息为空, 已忽略")
@@ -169,9 +169,11 @@ class ActiveBehaviorManager:
 				weekday=weekday_label(stored_time),
 				is_processed=False,
 				reasoning_content=reasoning,
+				api_content=reply_raw,
 			)
 			logger.success(
-				f"[Active] 已向群 {group_id} 发送{'唤醒' if is_revival_mode else '闲聊'}消息: {reply[:30]}..."
+				f"[Active] 已向群 {group_id} 发送"
+				f"{'唤醒' if is_revival_mode else '闲聊'}消息: chars={len(reply)}"
 			)
 			
 			# 触发后台记忆整理
@@ -265,4 +267,3 @@ class ActiveBehaviorManager:
 		)
 
 		return f"{base}{silence_text}"
-

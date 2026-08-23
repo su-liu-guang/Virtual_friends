@@ -41,6 +41,7 @@ class Message(Model):
     weekday = fields.CharField(max_length=10, null=True)
     is_processed = fields.BooleanField(default=False, index=True)
     reasoning_content = fields.TextField(null=True, description="DeepSeek 思考模式的思维链内容")
+    api_content = fields.TextField(null=True, description="模型原始回复，仅用于 API 历史回放")
     
     class Meta: # type: ignore
         table = "messages"
@@ -71,6 +72,11 @@ async def init_db():
         modules={'models': [__name__]}
     )
     conn = Tortoise.get_connection("default")
+
+    # generate_schemas 不会为已有 SQLite 表增加字段，需做幂等兼容迁移。
+    message_columns = await conn.execute_query_dict("PRAGMA table_info(messages)")
+    if message_columns and not any(row.get("name") == "api_content" for row in message_columns):
+        await conn.execute_query("ALTER TABLE messages ADD COLUMN api_content TEXT")
 
     # 图片摘要已彻底废弃；仅清理旧图片相关表，不影响消息和三层记忆。
     await conn.execute_query("DROP TABLE IF EXISTS image_cache")

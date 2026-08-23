@@ -81,6 +81,15 @@ class KnowledgeBase:
 
     async def initialize(self):
         """初始化知识库：加载索引并执行增量更新"""
+        if self.base_path.name.startswith("_"):
+            self.chunks = []
+            self.image_map = {}
+            self.file_hashes = {}
+            logger.info(
+                f"[Knowledge] 知识库目录 {self.base_path.name} 以下划线开头，已禁用加载"
+            )
+            return
+
         # 1. 加载现有索引
         if self.index_path.exists():
             try:
@@ -118,21 +127,33 @@ class KnowledgeBase:
         disk_files = []
         ignored_files = {"LICENSE.md", "CONTRIBUTING.md", "CHANGELOG.md", "CODE_OF_CONDUCT.md"}
         
+        underscore_ignored_count = 0
         for f in all_md_files:
             try:
                 rel_path = f.relative_to(self.base_path)
                 # 1. 排除隐藏目录 (.git, .github 等)
                 if any(part.startswith('.') for part in rel_path.parts):
                     continue
-                # 2. 排除特定文件名
+                # 2. 以下划线开头的文件或目录视为暂时禁用
+                if self._has_underscore_prefix(rel_path):
+                    underscore_ignored_count += 1
+                    continue
+                # 3. 排除特定文件名
                 if f.name in ignored_files:
                     continue
                 disk_files.append(f)
             except ValueError:
                 continue
 
+        if underscore_ignored_count:
+            logger.info(
+                f"[Knowledge] 已跳过 {underscore_ignored_count} 个位于下划线前缀路径中的文档"
+            )
+
+        current_image_map = self._collect_image_map(disk_files)
+
         if not disk_files:
-            if self.chunks:
+            if self.chunks or self.image_map or self.file_hashes:
                 logger.warning("磁盘上未找到有效文档，清空索引")
                 self.chunks = []
                 self.image_map = {}
@@ -159,7 +180,8 @@ class KnowledgeBase:
         # 2. 找出需要删除的文件 (在索引中但不在磁盘上)
         files_to_remove = set(self.file_hashes.keys()) - set(current_files_status.keys())
         
-        if not files_to_process and not files_to_remove:
+        image_map_changed = current_image_map != self.image_map
+        if not files_to_process and not files_to_remove and not image_map_changed:
             logger.success("知识库已是最新，无需更新")
             return
 
@@ -187,12 +209,40 @@ class KnowledgeBase:
             self.file_hashes[rel_path] = current_files_status[rel_path]
 
         # 5. 保存索引
+        self.image_map = current_image_map
         self._save_index()
         logger.success(f"增量更新完成: 当前共 {len(self.chunks)} 个片段")
 
     def _calculate_file_hash(self, file_path: Path) -> str:
         """计算文件 MD5"""
         return hashlib.md5(file_path.read_bytes()).hexdigest()
+
+    @staticmethod
+    def _has_underscore_prefix(path: Path) -> bool:
+        """路径中任意文件或目录名以下划线开头时视为禁用。"""
+        return any(part.startswith("_") for part in path.parts)
+
+    def _collect_image_map(self, files: List[Path]) -> Dict[str, str]:
+        """只从当前启用的知识文档中收集图片映射。"""
+        image_map: Dict[str, str] = {}
+        image_pattern = re.compile(r"!\[(.*?)\]\((.*?)\)")
+
+        for file_path in files:
+            try:
+                content = file_path.read_text(encoding="utf-8")
+                for match in image_pattern.finditer(content):
+                    alt = match.group(1)
+                    rel_path = match.group(2)
+                    if self._has_underscore_prefix(Path(rel_path)):
+                        continue
+                    img_abs_path = (file_path.parent / rel_path).resolve()
+                    if img_abs_path.is_file():
+                        img_key = alt if alt else img_abs_path.stem
+                        image_map[img_key] = str(img_abs_path)
+            except Exception as exc:
+                logger.warning(f"[Knowledge] 收集文档图片失败 {file_path}: {exc}")
+
+        return image_map
 
     async def rebuild_index(self):
         """强制重建索引 (已废弃，保留兼容性，实际调用增量更新)"""
@@ -207,17 +257,19 @@ class KnowledgeBase:
             content = file_path.read_text(encoding="utf-8")
             rel_source_path = str(file_path.relative_to(self.base_path))
             
-            # 1. 提取并替换图片
+            # 1. 提取并替换图片；图片映射由 _collect_image_map 统一维护
             def replace_image(match):
                 alt = match.group(1)
                 rel_path = match.group(2)
+
+                if self._has_underscore_prefix(Path(rel_path)):
+                    return f"(图片已禁用: {rel_path})"
                 
                 # 计算绝对路径
                 try:
                     img_abs_path = (file_path.parent / rel_path).resolve()
                     if img_abs_path.exists():
                         img_key = alt if alt else img_abs_path.stem
-                        self.image_map[img_key] = str(img_abs_path)
                         return f"(此处有一张图片，名称为：{img_key})"
                 except Exception:
                     pass
