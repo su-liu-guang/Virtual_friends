@@ -11,13 +11,36 @@ from .cache_metrics import AICallMetadata, record_cache_usage
 
 
 SUMMARY_CHAR_LIMIT = 1000
+SUMMARY_RELAXED_CHAR_LIMIT = 1500
 SUMMARY_MAX_ATTEMPTS = 6
 SUMMARY_MAX_TOKENS = 1600
 
 
-def _is_valid_summary(text: Optional[str], *, numbered: bool = False) -> bool:
-    """摘要必须非空、少于 1000 字；L1 还要求每行使用数字编号。"""
-    if not text or not text.strip() or len(text.strip()) >= SUMMARY_CHAR_LIMIT:
+def _summary_length_requirement(attempt: int) -> str:
+    """返回当前尝试对应的长度要求。"""
+    if attempt >= SUMMARY_MAX_ATTEMPTS:
+        return "本次不设置长度上限，但必须完整输出，不得机械截断。"
+    if attempt == SUMMARY_MAX_ATTEMPTS - 1:
+        return "完整输出最多1500个字符；优先精简，但不得机械截断。"
+    return "完整输出必须少于1000个字符；优先精简，但不得机械截断。"
+
+
+def _is_valid_summary(
+    text: Optional[str],
+    *,
+    attempt: int = 1,
+    numbered: bool = False,
+) -> bool:
+    """摘要必须非空并满足当前尝试的长度上限；L1 还要求数字编号。"""
+    if not text or not text.strip():
+        return False
+    char_count = len(text.strip())
+    if attempt < SUMMARY_MAX_ATTEMPTS - 1 and char_count >= SUMMARY_CHAR_LIMIT:
+        return False
+    if (
+        attempt == SUMMARY_MAX_ATTEMPTS - 1
+        and char_count > SUMMARY_RELAXED_CHAR_LIMIT
+    ):
         return False
     if not numbered:
         return True
@@ -173,13 +196,13 @@ class ChatClient:
         group_id: Optional[str] = None,
     ) -> Optional[str]:
         """生成 L1 摘要 - 格式提示词放在 system 第一条"""
-        FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
+        format_prompt_template = """[输出格式硬性要求 - 最高优先级]
 请严格按以下格式输出，每条占一行：
 1. [时间/时间段] [昵称] 做了什么/说了什么，简要内容。
 2. [时间/时间段] [昵称] 做了什么/说了什么，简要内容。
 ...
 禁止输出任何额外说明、Markdown 标记或代码块。
-完整输出必须少于1000个字符；优先保留重要事件，不得机械截断。
+{length_requirement}
 """.strip()
 
         task_text = (
@@ -193,18 +216,24 @@ class ChatClient:
         )
         attempts = max(1, min(retry, SUMMARY_MAX_ATTEMPTS))
         for attempt in range(1, attempts + 1):
+            length_requirement = _summary_length_requirement(attempt)
             retry_note = ""
             if attempt > 1:
                 retry_note = (
                     f"\n\n这是第{attempt}次尝试。上次输出为空、过长或编号格式不合格。"
-                    "请重新阅读原始对话，保留重要事实，并严格少于1000个字符。"
+                    f"请重新阅读原始对话，保留重要事实。{length_requirement}"
                 )
             attempt_content: Any = task_text + retry_note
             if image_blocks:
                 attempt_content = [{"type": "text", "text": task_text + retry_note}]
                 attempt_content.extend(dict(block) for block in image_blocks)
             messages: List[ChatCompletionMessageParam] = [
-                {"role": "system", "content": FORMAT_PROMPT},
+                {
+                    "role": "system",
+                    "content": format_prompt_template.format(
+                        length_requirement=length_requirement
+                    ),
+                },
                 {"role": "user", "content": attempt_content},  # type: ignore[typeddict-item]
             ]
             result = await self.generate_response(
@@ -212,14 +241,16 @@ class ChatClient:
                 retry=1,
                 temperature=0.5 if attempt == 1 else 0.3,
                 thinking_mode="disabled",
-                max_tokens=SUMMARY_MAX_TOKENS,
+                max_tokens=(
+                    None if attempt == SUMMARY_MAX_ATTEMPTS else SUMMARY_MAX_TOKENS
+                ),
                 metadata=AICallMetadata(
                     group_id=group_id,
                     call_type="l1_summary",
                     image_count=len(image_blocks or ()),
                 ),
             )
-            if _is_valid_summary(result, numbered=True):
+            if _is_valid_summary(result, attempt=attempt, numbered=True):
                 return result.strip() if result else None
             reason = "API失败或返回为空" if not result else f"格式/长度不合格(chars={len(result.strip())})"
             logger.warning(f"[Summary] L1 第{attempt}/{attempts}次生成未通过: {reason}")
@@ -239,20 +270,21 @@ class ChatClient:
         attempts: int = SUMMARY_MAX_ATTEMPTS,
     ) -> Optional[str]:
         """生成受长度约束的 L2/L3 摘要，始终重新参考原始输入。"""
-        system_prompt = (
-            "你负责压缩群聊长期记忆。只输出合并后的摘要正文，不使用Markdown标题。"
-            "完整输出必须少于1000个字符。优先保留人名、日期、事件顺序、人际关系、"
-            "用户偏好、重要决定、结果、未完成事项、后续承诺和因果关系；合并重复信息，"
-            "删除寒暄和无关细节，禁止编造，禁止机械截断。"
-        )
         attempt_limit = max(1, min(attempts, SUMMARY_MAX_ATTEMPTS))
         call_type = f"l{from_level}_to_l{to_level}"
         for attempt in range(1, attempt_limit + 1):
+            length_requirement = _summary_length_requirement(attempt)
+            system_prompt = (
+                "你负责压缩群聊长期记忆。只输出合并后的摘要正文，不使用Markdown标题。"
+                f"{length_requirement}优先保留人名、日期、事件顺序、人际关系、"
+                "用户偏好、重要决定、结果、未完成事项、后续承诺和因果关系；合并重复信息，"
+                "删除寒暄和无关细节，禁止编造。"
+            )
             retry_note = ""
             if attempt > 1:
                 retry_note = (
-                    f"\n\n这是第{attempt}次尝试。上次输出为空或达到1000字符。"
-                    "请重新阅读全部原始摘要，更紧凑地保留上述重要事实。"
+                    f"\n\n这是第{attempt}次尝试。上次输出为空或超过当次长度要求。"
+                    f"请重新阅读全部原始摘要，更紧凑地保留上述重要事实。{length_requirement}"
                 )
             messages: List[ChatCompletionMessageParam] = [
                 {"role": "system", "content": system_prompt},
@@ -266,10 +298,12 @@ class ChatClient:
                 retry=1,
                 temperature=0.5 if attempt == 1 else 0.3,
                 thinking_mode="disabled",
-                max_tokens=SUMMARY_MAX_TOKENS,
+                max_tokens=(
+                    None if attempt == SUMMARY_MAX_ATTEMPTS else SUMMARY_MAX_TOKENS
+                ),
                 metadata=AICallMetadata(group_id=group_id, call_type=call_type),
             )
-            if _is_valid_summary(result):
+            if _is_valid_summary(result, attempt=attempt):
                 return result.strip() if result else None
             reason = "API失败或返回为空" if not result else f"长度不合格(chars={len(result.strip())})"
             logger.warning(

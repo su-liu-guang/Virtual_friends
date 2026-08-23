@@ -126,7 +126,7 @@ class CacheMetricsTests(unittest.TestCase):
 class SummaryRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_l1_succeeds_on_sixth_attempt(self):
         client = ChatClient.__new__(ChatClient)
-        valid = "1. [12:00] 用户 完成了重要事项。"
+        valid = "1. " + "重要事项" * 500
         client.generate_response = AsyncMock(
             side_effect=["x" * 1000] * 5 + [valid]
         )
@@ -137,6 +137,7 @@ class SummaryRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.generate_response.await_count, 6)
         for call in client.generate_response.await_args_list:
             self.assertEqual(call.kwargs["retry"], 1)
+        self.assertIsNone(client.generate_response.await_args_list[5].kwargs["max_tokens"])
 
     async def test_l1_six_invalid_attempts_leave_no_result(self):
         client = ChatClient.__new__(ChatClient)
@@ -149,9 +150,9 @@ class SummaryRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_archive_summary_retries_from_original_source(self):
         client = ChatClient.__new__(ChatClient)
-        valid = "用户在指定日期完成任务，并约定后续继续跟进。"
+        valid = "长期记忆" * 500
         client.generate_response = AsyncMock(
-            side_effect=["x" * 1000] * 5 + [valid]
+            side_effect=["x" * 1000] * 4 + ["x" * 1501, valid]
         )
 
         result = await client.generate_archive_summary(
@@ -166,6 +167,51 @@ class SummaryRetryTests(unittest.IsolatedAsyncioTestCase):
         for call in client.generate_response.await_args_list:
             user_content = call.args[0][1]["content"]
             self.assertIn("原始L1内容", user_content)
+        self.assertIsNone(client.generate_response.await_args_list[5].kwargs["max_tokens"])
+
+    async def test_archive_summary_accepts_1500_chars_on_fifth_attempt(self):
+        client = ChatClient.__new__(ChatClient)
+        relaxed = "x" * 1500
+        client.generate_response = AsyncMock(
+            side_effect=["x" * 1000] * 4 + [relaxed]
+        )
+
+        result = await client.generate_archive_summary(
+            "原始L1内容",
+            group_id="g",
+            from_level=1,
+            to_level=2,
+        )
+
+        self.assertEqual(result, relaxed)
+        self.assertEqual(client.generate_response.await_count, 5)
+
+    async def test_manual_archive_sixth_attempt_has_no_length_limit(self):
+        def response(text):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+                usage=SimpleNamespace(prompt_tokens=1),
+            )
+
+        create = AsyncMock(
+            side_effect=[response("x" * 1000)] * 4
+            + [response("x" * 1501), response("x" * 3000)]
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        result = await archive_now.generate_bounded_summary(
+            client,
+            "test-model",
+            "原始摘要",
+            1,
+            2,
+        )
+
+        self.assertEqual(result, "x" * 3000)
+        self.assertEqual(create.await_count, 6)
+        self.assertNotIn("max_tokens", create.await_args_list[5].kwargs)
 
     async def test_manual_archive_rolls_back_on_concurrent_update(self):
         database = ConflictDatabase()

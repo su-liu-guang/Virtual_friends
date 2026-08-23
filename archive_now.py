@@ -14,6 +14,7 @@ ROOT_PATH = Path(__file__).resolve().parent.parent.parent
 DB_PATH = ROOT_PATH / "data" / "Virtual_friends" / "memory.db"
 ENV_PATH = ROOT_PATH / ".env.prod"
 SUMMARY_CHAR_LIMIT = 1000
+SUMMARY_RELAXED_CHAR_LIMIT = 1500
 SUMMARY_MAX_ATTEMPTS = 6
 SUMMARY_MAX_TOKENS = 1600
 ARCHIVE_LEVELS = ((1, 2, 20), (2, 3, 10))
@@ -42,20 +43,27 @@ async def generate_bounded_summary(
     from_level: int,
     to_level: int,
 ) -> Optional[str]:
-    system_prompt = (
-        "你负责压缩群聊长期记忆。只输出摘要正文，完整输出必须少于1000个字符。"
-        "优先保留人名、日期、事件顺序、人际关系、用户偏好、重要决定、结果、"
-        "未完成事项、后续承诺和因果关系；合并重复信息，删除寒暄，禁止编造和机械截断。"
-    )
     for attempt in range(1, SUMMARY_MAX_ATTEMPTS + 1):
+        if attempt == SUMMARY_MAX_ATTEMPTS:
+            length_requirement = "本次不设置长度上限，但必须完整输出，不得机械截断。"
+        elif attempt == SUMMARY_MAX_ATTEMPTS - 1:
+            length_requirement = "完整输出最多1500个字符；优先精简，但不得机械截断。"
+        else:
+            length_requirement = "完整输出必须少于1000个字符；优先精简，但不得机械截断。"
+        system_prompt = (
+            "你负责压缩群聊长期记忆。只输出摘要正文。"
+            f"{length_requirement}优先保留人名、日期、事件顺序、人际关系、用户偏好、"
+            "重要决定、结果、未完成事项、后续承诺和因果关系；合并重复信息，"
+            "删除寒暄，禁止编造。"
+        )
         retry_note = ""
         if attempt > 1:
             retry_note = (
-                f"\n\n这是第{attempt}次尝试。上次输出为空或达到1000字符，"
-                "请重新阅读全部原始摘要并更紧凑地保留重要事实。"
+                f"\n\n这是第{attempt}次尝试。上次输出为空或超过当次长度要求，"
+                f"请重新阅读全部原始摘要并更紧凑地保留重要事实。{length_requirement}"
             )
         try:
-            response = await client.chat.completions.create(
+            request_kwargs = dict(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -65,11 +73,24 @@ async def generate_bounded_summary(
                     },
                 ],
                 temperature=0.5 if attempt == 1 else 0.3,
-                max_tokens=SUMMARY_MAX_TOKENS,
                 extra_body={"thinking": {"type": "disabled"}},
             )
+            if attempt < SUMMARY_MAX_ATTEMPTS:
+                request_kwargs["max_tokens"] = SUMMARY_MAX_TOKENS
+            response = await client.chat.completions.create(**request_kwargs)
             result = (response.choices[0].message.content or "").strip()
-            if result and len(result) < SUMMARY_CHAR_LIMIT:
+            is_valid_length = (
+                attempt == SUMMARY_MAX_ATTEMPTS
+                or (
+                    attempt == SUMMARY_MAX_ATTEMPTS - 1
+                    and len(result) <= SUMMARY_RELAXED_CHAR_LIMIT
+                )
+                or (
+                    attempt < SUMMARY_MAX_ATTEMPTS - 1
+                    and len(result) < SUMMARY_CHAR_LIMIT
+                )
+            )
+            if result and is_valid_length:
                 usage = response.usage
                 print(
                     f"  [API] L{from_level}→L{to_level} attempt={attempt} "
