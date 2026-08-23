@@ -55,6 +55,13 @@ Virtual Friends 不追求复杂配置，只想成为你们群里最懂事、最�
 - **批量补写**：历史数据可用 `/回填记忆向量` 补齐向量，不漏记忆。
 
 ### 配置提示
+- 主聊天与图片理解统一使用 `deepseek-v4-flash-vision-exp`：
+	- `chat_api_url=https://api.deepseek.com`
+	- `chat_model_name=deepseek-v4-flash-vision-exp`
+- 图片会在本地下载校验后永久上传到 DeepSeek Files API，以 MD5 复用 `file_id`；单条消息最多处理 9 张。
+- 不再生成图片文字描述；最近聊天、L1 记忆整理和日报直接读取永久 `file_id`。单次上下文最多携带最近 14 张、总计 200 MiB 的图片。
+- 启动时会丢弃旧 `image_cache` 图片描述表，以及带过期时间的旧 `image_file_cache`。
+- `vision_api_*` 配置已不再使用，可暂时保留以便回滚。
 - 嵌入/重排使用 OpenAI 兼容接口：
 	- `embedding_api_url=https://api.siliconflow.cn/v1`
 	- `reranker_api_url=https://api.siliconflow.cn/v1/rerank`（需带路由）

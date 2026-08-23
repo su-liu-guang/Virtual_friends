@@ -1,14 +1,69 @@
+import asyncio
 import hashlib
+import io
 import aiohttp
 import re
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import List, Optional, Callable, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from nonebot import logger
 from openai.types.chat import ChatCompletionMessageParam
-from .database import Message, ImageCache, Summary
+from PIL import Image, UnidentifiedImageError
+from .database import ImageBatchCache, ImageFileCache, Message, Summary
 from .config import ConfigManager
 
-ERROR_CAPTION_PREFIXES = ("[图片识别失败", "[Vision Error")
+MAX_IMAGES_PER_MESSAGE = 9
+MAX_IMAGES_PER_CONTEXT = 14
+MAX_IMAGE_BYTES = 64 * 1024 * 1024
+MAX_TOTAL_IMAGE_BYTES = 200 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 8192
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 15
+SUPPORTED_IMAGE_FORMATS = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "GIF": "image/gif",
+    "WEBP": "image/webp",
+}
+
+
+@dataclass(frozen=True)
+class ImageSource:
+    """来自 OneBot 消息段的图片输入。"""
+
+    url: str
+    is_sticker: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedImage:
+    """已下载并校验、等待或已经上传到 Files API 的图片。"""
+
+    md5: str
+    data: bytes
+    filename: str
+    media_type: str
+    width: int
+    height: int
+    is_sticker: bool
+    file_id: Optional[str] = None
+
+    def to_content_block(self) -> Dict[str, Any]:
+        if not self.file_id:
+            raise ValueError("图片尚未上传到 Files API")
+        return {"type": "file", "file_id": self.file_id}
+
+
+@dataclass(frozen=True)
+class PreparedImageBatch:
+    """一条消息中通过校验的图片集合。"""
+
+    images: Tuple[PreparedImage, ...]
+    cache_key: Optional[str]
+    failed_count: int = 0
+
+    @property
+    def content_blocks(self) -> List[Dict[str, Any]]:
+        return [image.to_content_block() for image in self.images]
 
 # ====== 格式约束提示词 — 放在 system 最开头 ======
 OUTPUT_FORMAT_PROMPT = """[输出格式硬性约束 - 必须严格遵守]
@@ -164,38 +219,236 @@ def sanitize_persona_reply(raw_text: Optional[str]) -> str:
     return result
 
 
-def is_valid_caption(caption: Optional[str]) -> bool:
-    if not caption:
-        return False
-    stripped = caption.strip()
-    if not stripped:
-        return False
-    return not stripped.startswith(ERROR_CAPTION_PREFIXES)
+def _inspect_image(image_data: bytes) -> Tuple[str, str, int, int]:
+    """按文件实际内容识别格式与尺寸。"""
+    try:
+        with Image.open(io.BytesIO(image_data)) as image:
+            image_format = (image.format or "").upper()
+            width, height = image.size
+            image.verify()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("无法识别图片内容") from exc
+
+    media_type = SUPPORTED_IMAGE_FORMATS.get(image_format)
+    if not media_type:
+        raise ValueError(f"不支持的图片格式: {image_format or '未知'}")
+    if width <= 0 or height <= 0:
+        raise ValueError("图片尺寸无效")
+    if max(width, height) > MAX_IMAGE_DIMENSION:
+        raise ValueError(
+            f"图片单边超过 {MAX_IMAGE_DIMENSION} 像素: {width}x{height}"
+        )
+    return image_format, media_type, width, height
 
 
-async def process_image_message(image_url: str, vision_client, caption_override: Optional[str] = None, is_sticker: bool = False) -> str:
-    """处理图片消息,实现缓存优先策略"""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(image_url) as resp:
-            image_data = await resp.read()
-    
-    md5 = hashlib.md5(image_data).hexdigest()
-    
-    cached = await ImageCache.get_or_none(md5=md5)
-    if cached:
-        return md5
-    
-    if caption_override:
-        caption = caption_override
+async def _download_image(
+    session: aiohttp.ClientSession,
+    source: ImageSource,
+    byte_limit: int,
+) -> bytes:
+    if not source.url.startswith(("http://", "https://")):
+        raise ValueError("图片 URL 必须使用 http(s)")
+    if byte_limit <= 0:
+        raise ValueError("本条消息的图片总大小已达上限")
+
+    async with session.get(source.url) as response:
+        response.raise_for_status()
+        content_length = response.content_length
+        if content_length is not None and content_length > byte_limit:
+            raise ValueError(f"图片超过剩余大小限制: {content_length} bytes")
+
+        chunks: List[bytes] = []
+        total = 0
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            total += len(chunk)
+            if total > byte_limit:
+                raise ValueError(f"图片超过大小限制: > {byte_limit} bytes")
+            chunks.append(chunk)
+        if not chunks:
+            raise ValueError("图片内容为空")
+        return b"".join(chunks)
+
+
+def _build_image_batch(
+    images: Sequence[PreparedImage], failed_count: int = 0
+) -> PreparedImageBatch:
+    if not images:
+        return PreparedImageBatch((), None, failed_count)
+    if len(images) == 1:
+        cache_key = images[0].md5
     else:
-        caption = await vision_client.recognize_image(image_url, is_sticker=is_sticker)
-    
-    if is_valid_caption(caption):
-        await ImageCache.create(md5=md5, caption=caption)
-    else:
-        logger.warning("[Vision] 识别结果无效，已跳过缓存写入（请检查模型是否支持图像识别）")
-    
-    return md5
+        ordered_digests = "\0".join(image.md5 for image in images)
+        cache_key = hashlib.md5(ordered_digests.encode("ascii")).hexdigest()
+    return PreparedImageBatch(tuple(images), cache_key, failed_count)
+
+
+async def prepare_image_messages(
+    sources: Sequence[ImageSource],
+    user_text: str = "",
+) -> PreparedImageBatch:
+    """下载并准备一条消息中的最多 9 张图片。"""
+    selected_sources = list(sources[:MAX_IMAGES_PER_MESSAGE])
+    ignored_count = max(0, len(sources) - len(selected_sources))
+    if ignored_count:
+        logger.warning(
+            f"[Vision] 单条消息图片超过 {MAX_IMAGES_PER_MESSAGE} 张，"
+            f"已忽略后 {ignored_count} 张"
+        )
+
+    prepared: List[PreparedImage] = []
+    failed_count = 0
+    total_bytes = 0
+    timeout = aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for index, source in enumerate(selected_sources, start=1):
+            try:
+                remaining = MAX_TOTAL_IMAGE_BYTES - total_bytes
+                image_data = await _download_image(
+                    session, source, min(MAX_IMAGE_BYTES, remaining)
+                )
+                # Pillow 只解析文件头并校验结构，不执行像素级处理。
+                image_format, media_type, width, height = _inspect_image(image_data)
+                digest = hashlib.md5(image_data).hexdigest()
+                extension = "jpg" if image_format == "JPEG" else image_format.lower()
+                prepared.append(
+                    PreparedImage(
+                        md5=digest,
+                        data=image_data,
+                        filename=f"{digest}.{extension}",
+                        media_type=media_type,
+                        width=width,
+                        height=height,
+                        is_sticker=source.is_sticker,
+                    )
+                )
+                total_bytes += len(image_data)
+                logger.debug(
+                    f"[Vision] 图{index}已准备: format={image_format}, "
+                    f"size={width}x{height}, bytes={len(image_data)}"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failed_count += 1
+                logger.warning(f"[Vision] 图{index}准备失败，已跳过: {exc}")
+
+    return _build_image_batch(prepared, failed_count)
+
+
+async def upload_image_files(batch: PreparedImageBatch, chat_client) -> PreparedImageBatch:
+    """复用永久 file_id，未命中时上传；单图失败不影响其余图片。"""
+    if not batch.images:
+        return batch
+
+    uploaded_images: List[PreparedImage] = []
+    failed_count = batch.failed_count
+    api_scope = getattr(chat_client, "file_cache_scope", "")
+
+    for index, image in enumerate(batch.images, start=1):
+        try:
+            # DeepSeek file_id 归属于上传时使用的 API Key，换 Key 后必须重传。
+            scoped_cache_key = hashlib.md5(
+                f"{api_scope}\0{image.md5}".encode("ascii")
+            ).hexdigest()
+            cached = await ImageFileCache.get_or_none(md5=scoped_cache_key)
+            if cached:
+                uploaded_images.append(replace(image, file_id=cached.file_id))
+                logger.debug(f"[Vision] 图{index} Files API 缓存命中")
+                continue
+
+            result = await chat_client.upload_image_file(
+                image.data,
+                image.filename,
+                image.media_type,
+            )
+            if not result:
+                raise RuntimeError("Files API 上传未返回结果")
+            file_id = result
+            await ImageFileCache.update_or_create(
+                md5=scoped_cache_key,
+                defaults={
+                    "file_id": file_id,
+                    "filename": image.filename,
+                },
+            )
+            uploaded_images.append(replace(image, file_id=file_id))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failed_count += 1
+            logger.warning(f"[Vision] 图{index}上传失败，已跳过: {exc}")
+
+    uploaded_batch = _build_image_batch(uploaded_images, failed_count)
+    if uploaded_batch.images and uploaded_batch.cache_key:
+        await ImageBatchCache.update_or_create(
+            md5=uploaded_batch.cache_key,
+            defaults={
+                "api_scope": api_scope,
+                "files": [
+                    {
+                        "file_id": image.file_id,
+                        "bytes": len(image.data),
+                    }
+                    for image in uploaded_batch.images
+                ],
+            },
+        )
+    return uploaded_batch
+
+
+async def collect_message_image_blocks(
+    messages: Sequence[Any],
+    api_scope: str,
+) -> Dict[Any, List[Dict[str, Any]]]:
+    """为一组消息选取可直接发送的永久图片，优先保留较新的图片。"""
+    cache_keys = {
+        msg.image_md5
+        for msg in messages
+        if getattr(msg, "role", None) == "user" and getattr(msg, "image_md5", None)
+    }
+    if not cache_keys:
+        return {}
+
+    rows = await ImageBatchCache.filter(md5__in=cache_keys).all()
+    cache_map = {
+        row.md5: row
+        for row in rows
+        if row.api_scope == api_scope and isinstance(row.files, list)
+    }
+
+    selected: Dict[Any, List[Dict[str, Any]]] = {}
+    image_count = 0
+    total_bytes = 0
+    for msg in reversed(messages):
+        if getattr(msg, "role", None) != "user":
+            continue
+        row = cache_map.get(getattr(msg, "image_md5", None))
+        if not row:
+            continue
+
+        blocks: List[Dict[str, Any]] = []
+        for item in row.files:
+            if not isinstance(item, dict):
+                continue
+            file_id = item.get("file_id")
+            file_bytes = item.get("bytes", 0)
+            if not isinstance(file_id, str) or not file_id:
+                continue
+            if not isinstance(file_bytes, int) or file_bytes < 0:
+                continue
+            if image_count >= MAX_IMAGES_PER_CONTEXT:
+                break
+            if total_bytes + file_bytes > MAX_TOTAL_IMAGE_BYTES:
+                continue
+            blocks.append({"type": "file", "file_id": file_id})
+            image_count += 1
+            total_bytes += file_bytes
+        if blocks:
+            selected[msg.id] = blocks
+        if image_count >= MAX_IMAGES_PER_CONTEXT:
+            break
+    return selected
 
 
 async def generate_with_format_retry(
@@ -245,17 +498,24 @@ async def generate_with_format_retry(
 class ContextBuilder:
     """上下文构建器"""
     
-    def __init__(self, config_manager: ConfigManager, knowledge_base=None):
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        knowledge_base=None,
+        file_cache_scope: str = "",
+    ):
         self.config_manager = config_manager
         self.knowledge_base = knowledge_base
+        self.file_cache_scope = file_cache_scope
     
     async def build_context(
         self, 
         group_id: str, 
         user_nickname: str, 
-        current_time: datetime
+        current_time: datetime,
+        current_images: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> List[ChatCompletionMessageParam]:
-        """构建完整的对话上下文"""
+        """构建完整上下文，永久图片只附加到对应的 user 消息。"""
         config = self.config_manager.get_instance_config(group_id)
         persona_prompt = self.config_manager.get_persona_prompt(config["persona_name"])
         
@@ -267,6 +527,11 @@ class ContextBuilder:
             .all()
         )
         recent_msgs = list(reversed(recent_msgs_desc))
+        historical_image_blocks = (
+            await collect_message_image_blocks(recent_msgs, self.file_cache_scope)
+            if self.file_cache_scope
+            else {}
+        )
 
         # ---- L1/L2/L3 摘要（加 limit 截断） ----
         all_l1 = (
@@ -351,11 +616,15 @@ class ContextBuilder:
         # ---- Recent Layer ----
         for msg in recent_msgs:
             content = msg.content
-            
-            if msg.image_md5:
-                cache = await ImageCache.get_or_none(md5=msg.image_md5)
-                if cache:
-                    content = f"[系统注解: 图片内容为 {cache.caption}]\n{content}" if content else f"[系统注解: 图片内容为 {cache.caption}]"
+
+            is_current_image_message = bool(
+                current_images and last_user_msg and msg.id == last_user_msg.id
+            )
+            image_blocks = (
+                [dict(block) for block in current_images]
+                if is_current_image_message
+                else historical_image_blocks.get(msg.id, [])
+            )
             
             local_ts = msg.timestamp.astimezone()
             time_prefix = f"[{local_ts.strftime('%Y-%m-%d %H:%M')}] "
@@ -370,6 +639,11 @@ class ContextBuilder:
                 "role": role,  # type: ignore
                 "content": content
             }
+            if role == "user" and image_blocks:
+                message["content"] = [  # type: ignore[index]
+                    {"type": "text", "text": content},
+                    *image_blocks,
+                ]
             if msg.role == "ai" and msg.reasoning_content:
                 message["reasoning_content"] = msg.reasoning_content  # type: ignore[index]
             messages.append(message)
@@ -397,12 +671,42 @@ class ContextBuilder:
             if messages[i]["role"] == "user":
                 cur = messages[i].get("content", "")
                 if isinstance(cur, str):
-                    messages[i]["content"] = last_user_prefix + cur + section_short_reminder  # type: ignore[index]
+                    full_text = last_user_prefix + cur + section_short_reminder
+                    messages[i]["content"] = full_text  # type: ignore[index]
+                elif isinstance(cur, list):
+                    blocks = [dict(block) for block in cur]
+                    if blocks and blocks[0].get("type") == "text":
+                        blocks[0]["text"] = (
+                            last_user_prefix
+                            + str(blocks[0].get("text", ""))
+                            + section_short_reminder
+                        )
+                    else:
+                        blocks.insert(
+                            0,
+                            {
+                                "type": "text",
+                                "text": last_user_prefix + section_short_reminder,
+                            },
+                        )
+                    messages[i]["content"] = blocks  # type: ignore[index]
                 break
 
         # ====== DEBUG: 各部分长度测量 ======
         _total_system = len(section_format_prompt) + len(section_persona) + len(section_l3) + len(section_l2) + len(section_l1) + len(section_format_reminder)
-        _recent_total = sum(len(m.get("content", "")) for m in messages if m["role"] in ("user", "assistant"))
+        _recent_total = 0
+        for message in messages:
+            if message["role"] not in ("user", "assistant"):
+                continue
+            content = message.get("content", "")
+            if isinstance(content, str):
+                _recent_total += len(content)
+            elif isinstance(content, list):
+                _recent_total += sum(
+                    len(block.get("text", ""))
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
         _total_all = _total_system + _recent_total
         logger.info(
             f"[Cache Profiler] group={group_id} total_chars={_total_all} | "

@@ -34,7 +34,7 @@ async def main():
     env = load_dotenv(str(ENV_PATH))
     api_key = env.get("chat_api_key", "")
     base_url = env.get("chat_api_url", "https://api.deepseek.com/v1")
-    model = env.get("chat_model_name", "deepseek-chat")
+    model = env.get("chat_model_name", "deepseek-v4-flash-vision-exp")
 
     if not api_key:
         print("[FATAL] chat_api_key 未设置")

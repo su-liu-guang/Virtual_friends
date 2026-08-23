@@ -9,9 +9,9 @@ NoneBot2 插件，为 QQ 群聊提供 AI 驱动的虚拟好友。功能包括：
 ```
 __init__.py         # 入口：命令注册、生命周期、消息处理主循环
 active_behavior.py  # 主动行为：自主判断何时在群里发言
-clients.py          # AI 服务封装：Vision/Chat/Embedding 三客户端
+clients.py          # AI 服务封装：Chat/Embedding 客户端
 config.py           # 配置管理：personas.json + groups.json 读写
-database.py         # Tortoise ORM 模型：Message/Summary/ImportantEvent/ImageCache
+database.py         # Tortoise ORM 模型：消息、摘要、永久图片文件与图片组映射
 knowledge.py        # 向量知识库：Markdown 文档 → 分块 → 向量 → 语义检索
 logic.py            # 上下文构建：system prompt 拼装、格式约束与清洗
 scheduler.py        # 后台调度：消息批量处理、摘要归档、事实库维护
@@ -24,7 +24,7 @@ summary.py          # 日报生成：AI 结构化数据 + 本地统计 → HTML 
 用户消息 → __init__.py (handle_message)
   ├─ knowledge.py (向量检索 → system prompt)
   ├─ logic.py (ContextBuilder: 拼装 persona + 摘要 + 事实 + 最近消息)
-  ├─ clients.py (ChatClient 生成回复, VisionClient 识别图片)
+  ├─ clients.py (ChatClient 统一生成文本与图像理解回复)
   └─ scheduler.py (后台异步入队: 批量摘要 + 事实提取)
        └─ active_behavior.py (定时主动发言)
 ```
@@ -62,14 +62,15 @@ summary.py          # 日报生成：AI 结构化数据 + 本地统计 → HTML 
 
 ## Database
 
-SQLite (aiosqlite, WAL mode)，路径：`data/Virtual_friends/database.sqlite`
+SQLite (aiosqlite, WAL mode)，路径：`data/Virtual_friends/memory.db`
 
 | 表 | 关键字段 | 用途 |
 |----|---------|------|
 | `messages` | group_id, role(user/ai), content, image_md5, is_processed | 聊天记录 |
 | `summaries` | group_id, level(1/2/3), content, time_range, is_archived | 三层摘要 |
 | `important_events` | group_id, event_content, fact_type, confidence, validity, expires_at | 结构化事实 |
-| `image_cache` | md5(PK), caption | 图片识别缓存 |
+| `image_file_cache` | scoped_md5(PK), file_id, filename | 按 API Key 隔离的 DeepSeek Files API 永久文件引用 |
+| `image_batch_cache` | md5(PK), api_scope, files | 消息图片组与有序 file_id/大小映射 |
 
 初始化：`init_db()` at `database.py`
 
@@ -80,9 +81,10 @@ SQLite (aiosqlite, WAL mode)，路径：`data/Virtual_friends/database.sqlite`
 - `data/Virtual_friends/groups.json` — 每群配置（persona 绑定、回复率、主动模式参数等）
 - `data/Virtual_friends/knowledge/` — Markdown 知识文档
 
-### 环境变量（通过 `.env.dev`）
+### 环境变量（通过 `.env.prod`）
 - `chat_api_key/base_url/model_name` — 文本模型
-- `vision_api_key/base_url/model_name` — 视觉模型
+- `chat_model_name=deepseek-v4-flash-vision-exp` — 统一的文本+视觉模型
+- `vision_api_*` — 已停止使用，可暂时保留用于回滚
 - `embedding_api_key/base_url/model_name` — 向量模型
 - `reranker_api_key/url/model` — Reranker（可选）
 
@@ -127,9 +129,9 @@ pip install -r requirements.txt
 ```
 __init__.py        770L  入口、18 个命令、定时任务注册
 active_behavior.py 267L  ActiveBehaviorManager
-clients.py         430L  VisionClient / ChatClient / EmbeddingClient
+clients.py         ChatClient / EmbeddingClient
 config.py          261L  ConfigManager
-database.py         66L  4 models + init_db()
+database.py         4 models + init_db()
 knowledge.py       317L  KnowledgeBase + RerankerClient
 logic.py           302L  ContextBuilder + format helpers
 scheduler.py       241L  MemoryScheduler

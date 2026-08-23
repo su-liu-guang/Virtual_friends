@@ -4,6 +4,7 @@ from typing import List
 from nonebot import logger
 from openai.types.chat import ChatCompletionMessageParam
 from .database import Message, Summary
+from .logic import collect_message_image_blocks
 
 class MemoryScheduler:
     """后台记忆整理调度器"""
@@ -43,6 +44,10 @@ class MemoryScheduler:
         if not messages:
             return
         
+        image_blocks_by_message = await collect_message_image_blocks(
+            messages,
+            self.chat_client.file_cache_scope,
+        )
         context_lines = []
         for msg in messages:
             role_label = "AI" if msg.role == "ai" else "用户"
@@ -50,12 +55,24 @@ class MemoryScheduler:
             local_timestamp = msg.timestamp.astimezone()
             time_str = f"{local_timestamp.strftime('%Y-%m-%d %H:%M')} {msg.weekday}"
             content = msg.content or "(无文本内容)"
+            if msg.id in image_blocks_by_message:
+                content += f" [附图{len(image_blocks_by_message[msg.id])}张]"
             context_lines.append(f"[{time_str}] {display_name}: {content}")
         
         context = "\n".join(context_lines)
         
         # 生成摘要
-        summary_ok = await self._generate_summary(group_id, context, messages)
+        ordered_image_blocks = [
+            block
+            for msg in messages
+            for block in image_blocks_by_message.get(msg.id, [])
+        ]
+        summary_ok = await self._generate_summary(
+            group_id,
+            context,
+            messages,
+            ordered_image_blocks,
+        )
 
         # 标记已处理
         if summary_ok:
@@ -66,9 +83,18 @@ class MemoryScheduler:
                 f"[Scheduler] 本批处理未完成 (summary_ok={summary_ok})，保持未处理状态以便重试"
             )
     
-    async def _generate_summary(self, group_id: str, context: str, messages: List) -> bool:
+    async def _generate_summary(
+        self,
+        group_id: str,
+        context: str,
+        messages: List,
+        image_blocks: List,
+    ) -> bool:
         """生成 L1 摘要，成功返回 True"""
-        summary_text = await self.chat_client.generate_summary(context)
+        summary_text = await self.chat_client.generate_summary(
+            context,
+            image_blocks=image_blocks,
+        )
         if not summary_text:
             logger.error(f"[Scheduler] 生成摘要失败，已跳过写入 (group={group_id})")
             return False

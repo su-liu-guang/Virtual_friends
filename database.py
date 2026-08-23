@@ -1,14 +1,32 @@
 from tortoise import fields, Tortoise
 from tortoise.models import Model
-from datetime import datetime
 
-class ImageCache(Model):
+
+class ImageFileCache(Model):
+    """DeepSeek Files API 永久文件引用缓存。"""
+
+    # API 地址/Key 指纹与原图 MD5 的组合哈希，避免换 Key 后复用无权限的 file_id。
     md5 = fields.CharField(max_length=32, pk=True)
-    caption = fields.TextField()
+    file_id = fields.CharField(max_length=128)
+    filename = fields.CharField(max_length=512)
     created_at = fields.DatetimeField(auto_now_add=True)
-    
+
     class Meta: # type: ignore
-        table = "image_cache"
+        table = "image_file_cache"
+
+
+class ImageBatchCache(Model):
+    """消息图片组与有序 file_id 的映射。"""
+
+    md5 = fields.CharField(max_length=32, pk=True)
+    api_scope = fields.CharField(max_length=64)
+    files = fields.JSONField()
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta: # type: ignore
+        table = "image_batch_cache"
+
 
 class Message(Model):
     id = fields.IntField(pk=True)
@@ -40,6 +58,7 @@ class Summary(Model):
     class Meta: # type: ignore
         table = "summaries"
 
+
 async def init_db():
     """初始化数据库"""
     from pathlib import Path
@@ -51,4 +70,15 @@ async def init_db():
         db_url='sqlite://data/Virtual_friends/memory.db',
         modules={'models': [__name__]}
     )
+    conn = Tortoise.get_connection("default")
+
+    # 图片摘要已彻底废弃；仅清理旧图片相关表，不影响消息和三层记忆。
+    await conn.execute_query("DROP TABLE IF EXISTS image_cache")
+
+    # 旧版 file_id 带 expires_at，不能代表永久文件，直接丢弃并重建。
+    columns = await conn.execute_query_dict("PRAGMA table_info(image_file_cache)")
+    if any(row.get("name") == "expires_at" for row in columns):
+        await conn.execute_query("DROP TABLE IF EXISTS image_batch_cache")
+        await conn.execute_query("DROP TABLE IF EXISTS image_file_cache")
+
     await Tortoise.generate_schemas()

@@ -15,10 +15,13 @@ from pathlib import Path
 
 from .config import ConfigManager
 from .database import init_db, Message, Summary
-from .clients import VisionClient, ChatClient, EmbeddingClient
+from .clients import ChatClient, EmbeddingClient
 from .logic import (
     ContextBuilder,
-    process_image_message,
+    ImageSource,
+    PreparedImageBatch,
+    prepare_image_messages,
+    upload_image_files,
     sanitize_persona_reply,
     has_complete_persona_reply_tag,
     FORMAT_RETRY_SYSTEM,
@@ -39,11 +42,14 @@ __plugin_meta__ = PluginMetadata(
 
 # ================= 全局组件与客户端 =================
 config_manager = ConfigManager()
-vision_client = VisionClient()
 chat_client = ChatClient()
 embedding_client = EmbeddingClient()
 knowledge_base = KnowledgeBase()
-context_builder = ContextBuilder(config_manager, knowledge_base)
+context_builder = ContextBuilder(
+    config_manager,
+    knowledge_base,
+    file_cache_scope=chat_client.file_cache_scope,
+)
 memory_scheduler = MemoryScheduler(chat_client)
 active_behavior_manager = ActiveBehaviorManager(config_manager, chat_client, context_builder, memory_scheduler)
 daily_summary_generator = DailySummaryGenerator(chat_client, config_manager)
@@ -132,7 +138,15 @@ def format_context_for_debug(context: list) -> str:
     for idx, msg in enumerate(context, start=1):
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
-        if not isinstance(content, str):
+        if isinstance(content, list):
+            safe_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "file":
+                    safe_blocks.append({"type": "file", "file_id": "<file_id omitted>"})
+                else:
+                    safe_blocks.append(block)
+            content = json.dumps(safe_blocks, ensure_ascii=False)
+        elif not isinstance(content, str):
             try:
                 content = json.dumps(content, ensure_ascii=False)
             except TypeError:
@@ -158,6 +172,7 @@ def format_display_time(dt: datetime) -> str:
 
 def get_weekday_label(dt: datetime) -> str:
     return f"星期{WEEKDAY_CN[dt.isoweekday() - 1]}"
+
 
 # ================= 消息处理 =================
 
@@ -195,17 +210,27 @@ async def handle_message(bot: Bot, event: MessageEvent):
 
     logger.info(f"收到消息 [群组: {group_id}] [用户: {event.user_id}]: {text_content[:50]}...")
     
+    image_batch = PreparedImageBatch((), None)
     image_md5 = None
     if has_image:
+        image_sources = []
         for seg in event.message:
             if seg.type == "image":
-                image_url = seg.data["url"]
+                image_url = str(seg.data.get("url", ""))
                 summary = seg.data.get("summary", "")
-                is_sticker = bool(summary)
-                logger.debug(f"检测到图片: {image_url[:50]}... (Summary: {summary})")
-                image_md5 = await process_image_message(image_url, vision_client, is_sticker=is_sticker)
-                logger.debug(f"图片处理完成, MD5: {image_md5}")
-                break
+                image_sources.append(
+                    ImageSource(url=image_url, is_sticker=bool(summary))
+                )
+        image_batch = await prepare_image_messages(image_sources, text_content)
+        image_batch = await upload_image_files(image_batch, chat_client)
+        image_md5 = image_batch.cache_key
+        logger.debug(
+            f"图片准备完成: success={len(image_batch.images)}, "
+            f"failed={image_batch.failed_count}, cache_key={image_md5}"
+        )
+        if not image_batch.images and not text_content:
+            await message_handler.send("图片读取失败，请重新发送")
+            return
     
     timestamp = get_current_time()
     display_time = format_display_time(timestamp)
@@ -234,7 +259,7 @@ async def handle_message(bot: Bot, event: MessageEvent):
     context = await context_builder.build_context(
         group_id=group_id,
         user_nickname=user_nickname,
-        current_time=timestamp
+        current_time=timestamp,
     )
     logger.debug(format_context_for_debug(context))
     response_raw, reasoning = await generate_with_format_retry(

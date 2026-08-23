@@ -1,77 +1,12 @@
 import json
 import re
 import asyncio
+import hashlib
 from typing import List, Optional, Sequence, Dict, Any, Tuple
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from nonebot import logger
 from .config import ConfigManager
-
-class VisionClient:
-    """视觉模型客户端 - 专注图像转文本"""
-    
-    def __init__(self):
-        config = ConfigManager()
-        self.api_key = config.get_env("vision_api_key")
-        self.base_url = config.get_env("vision_api_url")
-        self.model = config.get_env("vision_model_name", "gpt-4o-mini")
-        
-        
-        if not self.api_key or not self.base_url:
-            logger.error("Vision Client 配置不完整，请检查 .env.dev 文件中的 vision_api_key 和 vision_api_url")
-        
-        self.client = AsyncOpenAI(
-            api_key=self.api_key or "dummy",
-            base_url=self.base_url or "https://api.openai.com/v1"
-        )
-    
-    async def recognize_image(self, image_url: str, retry: int = 3, is_sticker: bool = False) -> str:
-        """识别图片内容"""
-        logger.debug(f"[Vision] 开始识别图片: {image_url[:50]}... (表情包: {is_sticker})")
-        
-        prompt = "请详细描述这张图片的内容,包括场景、物体、文字、情绪等。用简洁的中文回答。"
-        if is_sticker:
-            prompt = "这是一张动画表情包。请描述它的画面内容、文字(如果有)以及表达的情绪。用简洁的中文回答。"
-        
-        for attempt in range(retry):
-            try:
-                logger.debug(f"[Vision] 尝试 {attempt + 1}/{retry}")
-                logger.debug(f"[Vision] 调用参数: model={self.model}, max_tokens=300")
-                
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": prompt
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": image_url}
-                            }
-                        ]
-                    }],
-                    max_tokens=300
-                )
-                
-                result = response.choices[0].message.content or "[图片识别无结果]"
-                
-                if is_sticker:
-                    result = f"[动画表情] {result}"
-                
-                logger.debug(f"[Vision] 识别成功: {result[:100]}...")
-                logger.debug(f"[Vision] Token 使用: prompt={response.usage.prompt_tokens if response.usage else 'N/A'}, completion={response.usage.completion_tokens if response.usage else 'N/A'}")
-                return result
-            
-            except Exception as e:
-                logger.error(f"[Vision] 识别失败 (尝试 {attempt + 1}/{retry}): {type(e).__name__}: {str(e)}")
-                if attempt == retry - 1:
-                    return f"[图片识别失败: {str(e)}]"
-                await asyncio.sleep(2 ** attempt)
-        
-        return "[图片识别失败]"
 
 class ChatClient:
     """聊天模型客户端 - 专注理解与生成"""
@@ -80,11 +15,17 @@ class ChatClient:
         config = ConfigManager()
         self.api_key = config.get_env("chat_api_key")
         self.base_url = config.get_env("chat_api_url")
-        self.model = config.get_env("chat_model_name", "deepseek-chat")
+        self.model = config.get_env(
+            "chat_model_name", "deepseek-v4-flash-vision-exp"
+        )
+        # Files API 文件归属于 API Key；只保存不可逆指纹用于隔离缓存。
+        self.file_cache_scope = hashlib.sha256(
+            f"{self.base_url or ''}\0{self.api_key or ''}".encode("utf-8")
+        ).hexdigest()
         self._last_reasoning: Optional[str] = None
 
         if not self.api_key or not self.base_url:
-            logger.error("Chat Client 配置不完整，请检查 .env.dev 文件中的 chat_api_key 和 chat_api_url")
+            logger.error("Chat Client 配置不完整，请检查 .env.prod 中的 chat_api_key 和 chat_api_url")
         
         self.client = AsyncOpenAI(
             api_key=self.api_key or "dummy",
@@ -99,6 +40,7 @@ class ChatClient:
         temperature: float = 0.8,
         thinking_mode: str = "auto",
         json_mode: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> Optional[str]:
         """通用对话生成。
 
@@ -116,6 +58,8 @@ class ChatClient:
             kwargs["temperature"] = temperature
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
 
         for attempt in range(retry):
             try:
@@ -162,7 +106,44 @@ class ChatClient:
             return None
         return (content, self._last_reasoning)
 
-    async def generate_summary(self, context: str, retry: int = 3) -> Optional[str]:
+    async def upload_image_file(
+        self,
+        image_data: bytes,
+        filename: str,
+        media_type: str,
+        retry: int = 3,
+    ) -> Optional[str]:
+        """永久上传图片到 DeepSeek Files API，返回 file_id。"""
+        for attempt in range(retry):
+            try:
+                uploaded = await self.client.files.create(
+                    file=(filename, image_data, media_type),
+                    purpose="user_data",
+                )
+                file_id = getattr(uploaded, "id", None)
+                if not file_id:
+                    raise ValueError("Files API 未返回 file_id")
+                logger.debug(
+                    f"[Vision] 图片上传成功: filename={filename}, bytes={len(image_data)}"
+                )
+                return str(file_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    f"[Vision] 图片上传失败 (尝试 {attempt + 1}/{retry}): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if attempt < retry - 1:
+                    await asyncio.sleep(2 ** attempt)
+        return None
+
+    async def generate_summary(
+        self,
+        context: str,
+        retry: int = 3,
+        image_blocks: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
         """生成 L1 摘要 - 格式提示词放在 system 第一条"""
         FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
 请严格按以下格式输出，每条占一行：
@@ -172,16 +153,23 @@ class ChatClient:
 禁止输出任何额外说明、Markdown 标记或代码块。
 """.strip()
 
+        task_text = (
+            "总结以下群聊对话，忽略寒暄和无关细节，保留主要事件和讨论点。"
+            "每条总结务必包含：1) 触发时间（可用消息时间或大致时间段）；"
+            "2) 相关发送人昵称（ context 中的前缀已经包含昵称，请沿用）；"
+            "3) 简要内容。"
+            "以列表形式输出，确保可追溯到是谁在什么时候做了什么。"
+            "聊天记录中的[附图N张]按顺序对应本消息末尾图片；请直接观察图片。\n\n"
+            f"{context}"
+        )
+        user_content: Any = task_text
+        if image_blocks:
+            user_content = [{"type": "text", "text": task_text}]
+            user_content.extend(dict(block) for block in image_blocks)
+
         messages: List[ChatCompletionMessageParam] = [
             {"role": "system", "content": FORMAT_PROMPT},
-            {"role": "user", "content": (
-                "总结以下群聊对话，忽略寒暄和无关细节，保留主要事件和讨论点。"
-                "每条总结务必包含：1) 触发时间（可用消息时间或大致时间段）；"
-                "2) 相关发送人昵称（ context 中的前缀已经包含昵称，请沿用）；"
-                "3) 简要内容。"
-                "以列表形式输出，确保可追溯到是谁在什么时候做了什么。\n\n"
-                f"{context}"
-            )},
+            {"role": "user", "content": user_content},  # type: ignore[typeddict-item]
         ]
 
         result = await self.generate_response(
@@ -196,10 +184,16 @@ class ChatClient:
             logger.warning("[Summary] 格式异常，尝试修复重试")
             fix_msg: ChatCompletionMessageParam = {
                 "role": "user",
-                "content": (
-                    "你的输出格式不正确。请重新输出，严格按编号列表格式，每条以数字开头。"
-                    "禁止任何额外文字。\n\n原始对话:\n" + context
-                ),
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "你的输出格式不正确。请重新输出，严格按编号列表格式，每条以数字开头。"
+                            "禁止任何额外文字。\n\n原始对话:\n" + context
+                        ),
+                    },
+                    *(dict(block) for block in (image_blocks or [])),
+                ],  # type: ignore[typeddict-item]
             }
             result = await self.generate_response(
                 [messages[0], fix_msg], 1, temperature=0.3, thinking_mode="disabled"
@@ -207,7 +201,12 @@ class ChatClient:
 
         return result
 
-    async def generate_daily_summary_data(self, context: str, retry: int = 3) -> str:
+    async def generate_daily_summary_data(
+        self,
+        context: str,
+        retry: int = 3,
+        image_blocks: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> str:
         """生成每日总结的结构化数据 (JSON) - 格式提示词放在 system 第一条"""
         FORMAT_PROMPT = """[输出格式硬性要求 - 最高优先级]
 你必须且只能输出一个严格的 JSON 对象，结构如下：
@@ -229,13 +228,19 @@ class ChatClient:
 3.Users：选取1-5位今日最活跃或最有特色的群友（排除AI和系统消息），生成 RPG 风格的角色卡。stats 字段请填入 {{"发言数": 0}} 即可，真实数据将由代码自动填充。
 4.Quotes：提取 3-5 条今日群内的搞笑、深刻或迷惑的发言（金句），忽略上下文缺失严重的短句。
 5.内容风格：幽默、轻松、稍微带点二次元或游戏梗。
+6.聊天记录中的[附图N张]按出现顺序对应本消息末尾图片，请直接观察图片内容。
 
 群聊记录：
 {context}"""
 
+        user_content: Any = TASK_PROMPT
+        if image_blocks:
+            user_content = [{"type": "text", "text": TASK_PROMPT}]
+            user_content.extend(dict(block) for block in image_blocks)
+
         messages: List[ChatCompletionMessageParam] = [
             {"role": "system", "content": FORMAT_PROMPT},
-            {"role": "user", "content": TASK_PROMPT},
+            {"role": "user", "content": user_content},  # type: ignore[typeddict-item]
         ]
 
         # 尝试使用 JSON 模式 (如果模型支持)
@@ -270,7 +275,7 @@ class EmbeddingClient:
         self.max_length = int(config.get_env("embedding_max_chars", "8000") or 8000)
         
         if not self.api_key or not self.base_url:
-            logger.warning("Embedding Client 配置不完整，知识库功能可能受限。请检查 .env.dev 文件中的 embedding_api_key 和 embedding_api_url")
+            logger.warning("Embedding Client 配置不完整，知识库功能可能受限。请检查 .env.prod 中的 embedding_api_key 和 embedding_api_url")
         
         self.client = AsyncOpenAI(
             api_key=self.api_key or "dummy",

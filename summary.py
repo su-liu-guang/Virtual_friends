@@ -18,6 +18,7 @@ except Exception:
 from .database import Message
 from .clients import ChatClient
 from .config import ConfigManager
+from .logic import collect_message_image_blocks
 
 class DailySummaryGenerator:
     def __init__(self, chat_client: ChatClient, config_manager: ConfigManager):
@@ -57,6 +58,10 @@ class DailySummaryGenerator:
             target_date = datetime.now().astimezone()
             
         messages = await self.get_messages_by_date(group_id, target_date)
+        image_blocks_by_message = await collect_message_image_blocks(
+            messages,
+            self.chat_client.file_cache_scope,
+        )
         
         # 1. 基础统计
         hour_counts = [0] * 24
@@ -115,12 +120,16 @@ class DailySummaryGenerator:
                     if msg.image_md5:
                         stats['img'] += 1
                     
-                # 文本记录 (用于 AI)
-                if msg.content:
+                # 文本和永久图片记录（用于 AI）
+                message_image_blocks = image_blocks_by_message.get(msg.id, [])
+                if msg.content or message_image_blocks:
                     time_str = local_timestamp.strftime("%H:%M")
                     # 给 Bot 消息添加标签，方便 AI 识别并排除
                     display_uid = f"[AI助手]{uid}" if is_bot else uid
-                    text_lines.append(f"[{time_str}] {display_uid}: {msg.content}")
+                    content = msg.content or "(无文本内容)"
+                    if message_image_blocks:
+                        content += f" [附图{len(message_image_blocks)}张]"
+                    text_lines.append(f"[{time_str}] {display_uid}: {content}")
         else:
             logger.info(f"群 {group_id} 今日无消息，将生成空数据报告")
 
@@ -133,7 +142,15 @@ class DailySummaryGenerator:
             context = "(今日无消息记录，请编造一份有趣的虚构日报，假设群友们都在潜水或者发生了什么神秘事件)"
             
         t_start_ai = time.time()
-        json_str = await self.chat_client.generate_daily_summary_data(context)
+        ordered_image_blocks = [
+            block
+            for msg in messages
+            for block in image_blocks_by_message.get(msg.id, [])
+        ]
+        json_str = await self.chat_client.generate_daily_summary_data(
+            context,
+            image_blocks=ordered_image_blocks,
+        )
         t_end_ai = time.time()
         logger.info(f"[Performance] AI 生成耗时: {t_end_ai - t_start_ai:.2f}s")
         logger.debug(f"AI Summary Raw Response: {json_str}")
