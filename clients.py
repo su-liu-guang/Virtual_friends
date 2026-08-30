@@ -1,5 +1,4 @@
 import json
-import re
 import asyncio
 import hashlib
 from typing import List, Optional, Sequence, Dict, Any, Tuple
@@ -29,9 +28,8 @@ def _is_valid_summary(
     text: Optional[str],
     *,
     attempt: int = 1,
-    numbered: bool = False,
 ) -> bool:
-    """摘要必须非空并满足当前尝试的长度上限；L1 还要求数字编号。"""
+    """摘要必须非空并满足当前尝试的长度上限。"""
     if not text or not text.strip():
         return False
     char_count = len(text.strip())
@@ -42,10 +40,7 @@ def _is_valid_summary(
         and char_count > SUMMARY_RELAXED_CHAR_LIMIT
     ):
         return False
-    if not numbered:
-        return True
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return bool(lines) and all(re.match(r"^\d+[.、]\s*\S", line) for line in lines)
+    return True
 
 class ChatClient:
     """聊天模型客户端 - 专注理解与生成"""
@@ -250,9 +245,13 @@ class ChatClient:
                     image_count=len(image_blocks or ()),
                 ),
             )
-            if _is_valid_summary(result, attempt=attempt, numbered=True):
+            if _is_valid_summary(result, attempt=attempt):
                 return result.strip() if result else None
-            reason = "API失败或返回为空" if not result else f"格式/长度不合格(chars={len(result.strip())})"
+            reason = (
+                "API失败或返回为空"
+                if not result or not result.strip()
+                else f"长度不合格(chars={len(result.strip())})"
+            )
             logger.warning(f"[Summary] L1 第{attempt}/{attempts}次生成未通过: {reason}")
             if not result and attempt < attempts:
                 await asyncio.sleep(min(2 ** (attempt - 1), 16))

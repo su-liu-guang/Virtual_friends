@@ -124,11 +124,21 @@ class CacheMetricsTests(unittest.TestCase):
 
 
 class SummaryRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_l1_accepts_non_numbered_summary(self):
+        client = ChatClient.__new__(ChatClient)
+        summary = "大家讨论了周末安排，并确定星期六下午集合。"
+        client.generate_response = AsyncMock(return_value=summary)
+
+        result = await client.generate_summary("原始对话", retry=6, group_id="g")
+
+        self.assertEqual(result, summary)
+        self.assertEqual(client.generate_response.await_count, 1)
+
     async def test_l1_succeeds_on_sixth_attempt(self):
         client = ChatClient.__new__(ChatClient)
         valid = "1. " + "重要事项" * 500
         client.generate_response = AsyncMock(
-            side_effect=["x" * 1000] * 5 + [valid]
+            side_effect=["x" * 1000] * 4 + ["x" * 1501, valid]
         )
 
         result = await client.generate_summary("原始对话", retry=6, group_id="g")
@@ -139,9 +149,9 @@ class SummaryRetryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(call.kwargs["retry"], 1)
         self.assertIsNone(client.generate_response.await_args_list[5].kwargs["max_tokens"])
 
-    async def test_l1_six_invalid_attempts_leave_no_result(self):
+    async def test_l1_six_empty_attempts_leave_no_result(self):
         client = ChatClient.__new__(ChatClient)
-        client.generate_response = AsyncMock(return_value="没有编号")
+        client.generate_response = AsyncMock(return_value=" ")
 
         result = await client.generate_summary("原始对话", retry=6, group_id="g")
 
