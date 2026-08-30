@@ -21,9 +21,10 @@ from .logic import (
     ImageSource,
     PreparedImageBatch,
     prepare_image_messages,
-    upload_image_files,
+    resolve_current_image_blocks,
     sanitize_reply,
 )
+from .image_upload import ImageUploadManager
 from .scheduler import MemoryScheduler
 from .active_behavior import ActiveBehaviorManager
 from .summary import DailySummaryGenerator
@@ -55,6 +56,7 @@ context_builder = ContextBuilder(
 memory_scheduler = MemoryScheduler(chat_client)
 active_behavior_manager = ActiveBehaviorManager(config_manager, chat_client, context_builder, memory_scheduler)
 daily_summary_generator = DailySummaryGenerator(chat_client, config_manager)
+image_upload_manager = ImageUploadManager(chat_client)
 
 try:
     scheduler = require("nonebot_plugin_apscheduler").scheduler
@@ -219,6 +221,8 @@ async def handle_message(bot: Bot, event: MessageEvent):
     
     image_batch = PreparedImageBatch((), None)
     image_md5 = None
+    current_image_blocks = []
+    image_persisted = False
     if has_image:
         image_sources = []
         for seg in event.message:
@@ -229,10 +233,20 @@ async def handle_message(bot: Bot, event: MessageEvent):
                     ImageSource(url=image_url, is_sticker=bool(summary))
                 )
         image_batch = await prepare_image_messages(image_sources, text_content)
-        image_batch = await upload_image_files(image_batch, chat_client)
         image_md5 = image_batch.cache_key
+        if image_batch.images:
+            current_image_blocks = await resolve_current_image_blocks(
+                image_batch, chat_client
+            )
+            try:
+                await image_upload_manager.enqueue(image_batch)
+                image_persisted = True
+            except Exception:
+                # 本地缓存异常不能阻断已经准备好的首次内联识图。
+                logger.exception("[Vision] 持久化后台上传任务失败")
         logger.debug(
             f"图片准备完成: success={len(image_batch.images)}, "
+            f"current={len(current_image_blocks)}, "
             f"failed={image_batch.failed_count}, cache_key={image_md5}"
         )
         if not image_batch.images and not text_content:
@@ -255,6 +269,15 @@ async def handle_message(bot: Bot, event: MessageEvent):
         weekday=weekday_label,
         is_processed=False
     )
+
+    if has_image and not current_image_blocks and not text_content:
+        if image_persisted:
+            await message_handler.send(
+                "图片已保存，但视觉服务暂时不可用。后台会继续上传，请稍后再次发送消息。"
+            )
+        else:
+            await message_handler.send("视觉服务暂时不可用，请稍后重新发送图片。")
+        return
     
 
     
@@ -267,6 +290,7 @@ async def handle_message(bot: Bot, event: MessageEvent):
         group_id=group_id,
         user_nickname=user_nickname,
         current_time=timestamp,
+        current_images=current_image_blocks,
     )
     logger.debug(format_context_for_debug(context))
     chat_result = await chat_client.generate_chat_reply(
@@ -275,13 +299,22 @@ async def handle_message(bot: Bot, event: MessageEvent):
         metadata=AICallMetadata(
             group_id=group_id,
             call_type="chat",
-            image_count=len(image_batch.images),
+            image_count=len(current_image_blocks),
         ),
     )
     response_raw, reasoning = chat_result if chat_result else (None, None)
     response = sanitize_reply(response_raw)
     if not response:
         logger.error("[Chat] 生成回复为空，已跳过存储与发送")
+        if has_image:
+            if image_persisted:
+                await message_handler.send(
+                    "AI 服务暂时不可用，图片和消息已保存，请稍后再试。"
+                )
+            else:
+                await message_handler.send(
+                    "AI 服务暂时不可用，消息已保存；请稍后重新发送图片。"
+                )
         return
     
     # 存储并发送回复
@@ -717,6 +750,7 @@ async def check_daily_summary():
 async def startup():
     init_cache_metrics()
     await init_db()
+    await image_upload_manager.start()
     await config_manager.initialize()
     await knowledge_base.initialize()
     if scheduler:
@@ -743,7 +777,10 @@ async def startup():
 
 @driver.on_shutdown
 async def shutdown():
-    # 1. 关闭数据库连接
+    # 1. 停止图片上传器，未完成任务会保留到下次启动。
+    await image_upload_manager.stop()
+
+    # 2. 关闭数据库连接
     from tortoise import Tortoise
     try:
         conn = Tortoise.get_connection("default")
@@ -754,7 +791,7 @@ async def shutdown():
     await Tortoise.close_connections()
     logger.debug("数据库连接已关闭")
 
-    # 2. 尝试优雅关闭 htmlrender 浏览器 (消除 Ctrl+C 报错)
+    # 3. 尝试优雅关闭 htmlrender 浏览器 (消除 Ctrl+C 报错)
     try:
         import nonebot.plugin
         if nonebot.plugin.get_plugin("nonebot_plugin_htmlrender"):

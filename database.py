@@ -28,6 +28,39 @@ class ImageBatchCache(Model):
         table = "image_batch_cache"
 
 
+class PendingImageUpload(Model):
+    """等待后台上传到 DeepSeek Files API 的本地图片。"""
+
+    # 与 ImageFileCache 使用相同的 API scope + 原图 MD5 组合哈希。
+    md5 = fields.CharField(max_length=32, pk=True)
+    api_scope = fields.CharField(max_length=64, index=True)
+    source_md5 = fields.CharField(max_length=32, index=True)
+    file_path = fields.CharField(max_length=1024)
+    filename = fields.CharField(max_length=512)
+    media_type = fields.CharField(max_length=64)
+    attempts = fields.IntField(default=0)
+    next_retry_at = fields.DatetimeField(index=True)
+    last_error = fields.TextField(null=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta: # type: ignore
+        table = "pending_image_uploads"
+
+
+class PendingImageBatch(Model):
+    """等待所有图片获得 file_id 的消息图片组。"""
+
+    md5 = fields.CharField(max_length=32, pk=True)
+    api_scope = fields.CharField(max_length=64)
+    images = fields.JSONField()
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta: # type: ignore
+        table = "pending_image_batches"
+
+
 class Message(Model):
     id = fields.IntField(pk=True)
     group_id = fields.CharField(max_length=50, index=True)

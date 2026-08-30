@@ -1,21 +1,32 @@
 import asyncio
+import base64
 import hashlib
 import io
 import aiohttp
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from nonebot import logger
 from openai.types.chat import ChatCompletionMessageParam
 from PIL import Image, UnidentifiedImageError
-from .database import ImageBatchCache, ImageFileCache, Message, Summary
+from .database import (
+    ImageBatchCache,
+    ImageFileCache,
+    Message,
+    PendingImageBatch,
+    Summary,
+)
 from .config import ConfigManager
 
 MAX_IMAGES_PER_MESSAGE = 9
 MAX_IMAGES_PER_CONTEXT = 14
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 200 * 1024 * 1024
+# Base64 会膨胀约三分之一；为 48 MiB 请求体限制预留文本和 JSON 空间。
+MAX_INLINE_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_INLINE_TOTAL_IMAGE_BYTES = 30 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 8192
 IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 15
 SUPPORTED_IMAGE_FORMATS = {
@@ -51,6 +62,19 @@ class PreparedImage:
         if not self.file_id:
             raise ValueError("图片尚未上传到 Files API")
         return {"type": "file", "file_id": self.file_id}
+
+    def to_inline_content_block(self) -> Dict[str, Any]:
+        """以内联 Base64 形式构造当前请求的图片块。"""
+        if len(self.data) > MAX_INLINE_IMAGE_BYTES:
+            raise ValueError("图片超过 32 MiB 内联限制")
+        encoded = base64.b64encode(self.data).decode("ascii")
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{self.media_type};base64,{encoded}",
+                "detail": "auto",
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -208,6 +232,65 @@ def _build_image_batch(
     return PreparedImageBatch(tuple(images), cache_key, failed_count)
 
 
+def scoped_image_cache_key(api_scope: str, image_md5: str) -> str:
+    """按 API 地址/Key 指纹隔离 Files API 缓存。"""
+    return hashlib.md5(f"{api_scope}\0{image_md5}".encode("ascii")).hexdigest()
+
+
+async def resolve_current_image_blocks(
+    batch: PreparedImageBatch,
+    chat_client,
+) -> List[Dict[str, Any]]:
+    """缓存命中使用 file_id，未命中的小图首次直接内联。
+
+    只有无法内联的大图才同步等待 Files API；普通 QQ 图片不会再被上传阻塞。
+    """
+    if not batch.images:
+        return []
+
+    api_scope = getattr(chat_client, "file_cache_scope", "")
+    resolved: List[Optional[Dict[str, Any]]] = [None] * len(batch.images)
+    oversized: List[PreparedImage] = []
+    oversized_indexes: List[int] = []
+    inline_bytes = 0
+
+    for index, image in enumerate(batch.images):
+        cache_key = scoped_image_cache_key(api_scope, image.md5)
+        cached = await ImageFileCache.get_or_none(md5=cache_key)
+        if cached:
+            resolved[index] = {"type": "file", "file_id": cached.file_id}
+            continue
+
+        if (
+            len(image.data) <= MAX_INLINE_IMAGE_BYTES
+            and inline_bytes + len(image.data) <= MAX_INLINE_TOTAL_IMAGE_BYTES
+        ):
+            resolved[index] = image.to_inline_content_block()
+            inline_bytes += len(image.data)
+            continue
+
+        oversized.append(image)
+        oversized_indexes.append(index)
+
+    if oversized:
+        logger.info(
+            f"[Vision] {len(oversized)} 张图片超过内联预算，改为同步 Files API"
+        )
+        uploaded = await upload_image_files(_build_image_batch(oversized), chat_client)
+        uploaded_map = {
+            image.md5: image.to_content_block() for image in uploaded.images
+        }
+        for index, image in zip(oversized_indexes, oversized):
+            resolved[index] = uploaded_map.get(image.md5)
+
+    blocks = [block for block in resolved if block is not None]
+    if len(blocks) != len(batch.images):
+        logger.warning(
+            f"[Vision] 当前请求仅携带 {len(blocks)}/{len(batch.images)} 张图片"
+        )
+    return blocks
+
+
 async def prepare_image_messages(
     sources: Sequence[ImageSource],
     user_text: str = "",
@@ -274,9 +357,7 @@ async def upload_image_files(batch: PreparedImageBatch, chat_client) -> Prepared
     for index, image in enumerate(batch.images, start=1):
         try:
             # DeepSeek file_id 归属于上传时使用的 API Key，换 Key 后必须重传。
-            scoped_cache_key = hashlib.md5(
-                f"{api_scope}\0{image.md5}".encode("ascii")
-            ).hexdigest()
+            scoped_cache_key = scoped_image_cache_key(api_scope, image.md5)
             cached = await ImageFileCache.get_or_none(md5=scoped_cache_key)
             if cached:
                 uploaded_images.append(replace(image, file_id=cached.file_id))
@@ -327,7 +408,7 @@ async def collect_message_image_blocks(
     messages: Sequence[Any],
     api_scope: str,
 ) -> Dict[Any, List[Dict[str, Any]]]:
-    """为一组消息选取可直接发送的永久图片，优先保留较新的图片。"""
+    """为消息选取图片；永久缓存未就绪时从本地队列内联。"""
     cache_keys = {
         msg.image_md5
         for msg in messages
@@ -342,34 +423,85 @@ async def collect_message_image_blocks(
         for row in rows
         if row.api_scope == api_scope and isinstance(row.files, list)
     }
+    pending_rows = await PendingImageBatch.filter(md5__in=cache_keys).all()
+    pending_map = {
+        row.md5: row
+        for row in pending_rows
+        if row.api_scope == api_scope and isinstance(row.images, list)
+    }
 
     selected: Dict[Any, List[Dict[str, Any]]] = {}
     image_count = 0
     total_bytes = 0
+    inline_bytes = 0
     for msg in reversed(messages):
         if getattr(msg, "role", None) != "user":
             continue
-        row = cache_map.get(getattr(msg, "image_md5", None))
-        if not row:
-            continue
+        message_cache_key = getattr(msg, "image_md5", None)
+        row = cache_map.get(message_cache_key)
 
         blocks: List[Dict[str, Any]] = []
-        for item in row.files:
-            if not isinstance(item, dict):
-                continue
-            file_id = item.get("file_id")
-            file_bytes = item.get("bytes", 0)
-            if not isinstance(file_id, str) or not file_id:
-                continue
-            if not isinstance(file_bytes, int) or file_bytes < 0:
-                continue
-            if image_count >= MAX_IMAGES_PER_CONTEXT:
-                break
-            if total_bytes + file_bytes > MAX_TOTAL_IMAGE_BYTES:
-                continue
-            blocks.append({"type": "file", "file_id": file_id})
-            image_count += 1
-            total_bytes += file_bytes
+        if row:
+            for item in row.files:
+                if not isinstance(item, dict):
+                    continue
+                file_id = item.get("file_id")
+                file_bytes = item.get("bytes", 0)
+                if not isinstance(file_id, str) or not file_id:
+                    continue
+                if not isinstance(file_bytes, int) or file_bytes < 0:
+                    continue
+                if image_count >= MAX_IMAGES_PER_CONTEXT:
+                    break
+                if total_bytes + file_bytes > MAX_TOTAL_IMAGE_BYTES:
+                    continue
+                blocks.append({"type": "file", "file_id": file_id})
+                image_count += 1
+                total_bytes += file_bytes
+        else:
+            pending = pending_map.get(message_cache_key)
+            if pending:
+                for item in pending.images:
+                    if not isinstance(item, dict):
+                        continue
+                    file_path = item.get("file_path")
+                    media_type = item.get("media_type")
+                    file_bytes = item.get("bytes", 0)
+                    if not isinstance(file_path, str) or not file_path:
+                        continue
+                    if not isinstance(media_type, str) or not media_type:
+                        continue
+                    if not isinstance(file_bytes, int) or file_bytes < 0:
+                        continue
+                    if image_count >= MAX_IMAGES_PER_CONTEXT:
+                        break
+                    if (
+                        file_bytes > MAX_INLINE_IMAGE_BYTES
+                        or inline_bytes + file_bytes > MAX_INLINE_TOTAL_IMAGE_BYTES
+                    ):
+                        continue
+                    try:
+                        image_data = await asyncio.to_thread(Path(file_path).read_bytes)
+                    except (OSError, ValueError) as exc:
+                        logger.warning(
+                            f"[Vision] 读取待上传图片失败，已跳过: {exc}"
+                        )
+                        continue
+                    if len(image_data) != file_bytes:
+                        logger.warning("[Vision] 待上传图片大小发生变化，已跳过")
+                        continue
+                    encoded = base64.b64encode(image_data).decode("ascii")
+                    blocks.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{encoded}",
+                                "detail": "auto",
+                            },
+                        }
+                    )
+                    image_count += 1
+                    inline_bytes += file_bytes
         if blocks:
             selected[msg.id] = blocks
         if image_count >= MAX_IMAGES_PER_CONTEXT:
